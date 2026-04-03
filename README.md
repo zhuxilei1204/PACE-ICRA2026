@@ -5,7 +5,8 @@
 
 
 ## 📝 Overview
-This is the official implementation of ICRA 2026 paper: [Towards Versatile Humanoid Table Tennis: Unified Reinforcement Learning with Prediction Augmentation ](https://arxiv.org/abs/2509.21690) 
+This is the official implementation of ICRA 2026 paper: [PACE: Physics Augmentation for Coordinated End-to-end
+Reinforcement Learning toward Versatile Humanoid Table Tennis](https://arxiv.org/abs/2509.21690) (Old title: Towards Versatile Humanoid Table Tennis: Unified Reinforcement Learning with Prediction Augmentation )
 
 
 **TL;DR:**
