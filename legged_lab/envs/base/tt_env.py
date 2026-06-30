@@ -242,7 +242,7 @@ class TTEnv(VecEnv):
         self.clip_obs = self.cfg.normalization.clip_observations
         self.num_perception = 6 # ball_pos(3) + robot_pos(3) = 9
 
-        self.action_scale = self.cfg.robot.action_scale
+        self.action_scale = self._resolve_action_scale(self.cfg.robot.action_scale)
         self.action_buffer = DelayBuffer(
             self.cfg.domain_rand.action_delay.params["max_delay"], self.num_envs, device=self.device
         )
@@ -298,6 +298,29 @@ class TTEnv(VecEnv):
         self.termination_contact_cfg.resolve(self.scene)
         self.feet_cfg = SceneEntityCfg(name="contact_sensor", body_names=self.cfg.robot.feet_body_names)
         self.feet_cfg.resolve(self.scene)
+        self.paddle_body_id = int(self.cfg.robot.paddle_body_index)
+        self.paddle_body_name = ""
+        if self.cfg.robot.paddle_body_name:
+            paddle_body_ids, paddle_body_names = self.robot.find_bodies(
+                self.cfg.robot.paddle_body_name, preserve_order=True
+            )
+            if len(paddle_body_ids) != 1:
+                raise ValueError(
+                    f"Expected exactly one paddle body matching {self.cfg.robot.paddle_body_name!r}, "
+                    f"found {paddle_body_names}."
+                )
+            self.paddle_body_id = paddle_body_ids[0]
+            self.paddle_body_name = paddle_body_names[0]
+        elif not 0 <= self.paddle_body_id < len(self.robot.body_names):
+            raise ValueError(
+                f"Configured paddle_body_index={self.paddle_body_id} is outside robot body range "
+                f"[0, {len(self.robot.body_names) - 1}]."
+            )
+        else:
+            self.paddle_body_name = self.robot.body_names[self.paddle_body_id]
+        self.paddle_local_offset = torch.tensor(
+            self.cfg.robot.paddle_local_offset, device=self.device, dtype=torch.float
+        )
 
         self.obs_scales = self.cfg.normalization.obs_scales
         self.add_noise = self.cfg.noise.add_noise
@@ -319,6 +342,7 @@ class TTEnv(VecEnv):
         self.has_first_bounce = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.has_first_bounce_prev = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.has_touch_own_table = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.has_touch_own_table_just_now = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.has_touch_own_table_prev = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.has_touch_opo_table_prev = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.has_return_own_table2_prev = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
@@ -667,6 +691,7 @@ class TTEnv(VecEnv):
         self.has_first_bounce[env_ids] = False
         self.has_first_bounce_prev[env_ids] = False
         self.has_touch_own_table[env_ids] = False
+        self.has_touch_own_table_just_now[env_ids] = False
         self.has_touch_own_table_prev[env_ids] = False
         self.has_touch_opo_table_prev[env_ids] = False
         self.has_return_own_table2_prev[env_ids] = False
@@ -729,6 +754,15 @@ class TTEnv(VecEnv):
             # Apply old states to simulation
             self.ball.write_root_pose_to_sim(old_states[:, :7], old_state_env_ids)
             self.ball.write_root_velocity_to_sim(old_states[:, 7:], old_state_env_ids)
+
+    def _resolve_action_scale(self, action_scale):
+        if isinstance(action_scale, (list, tuple)):
+            if len(action_scale) != self.num_actions:
+                raise ValueError(
+                    f"Expected action_scale length {self.num_actions}, got {len(action_scale)}."
+                )
+            return torch.tensor(action_scale, dtype=torch.float, device=self.device).unsqueeze(0)
+        return float(action_scale)
 
     def step(self, actions: torch.Tensor):
 
@@ -843,24 +877,15 @@ class TTEnv(VecEnv):
         self.ball_global_pos = self.ball.data.root_pos_w 
 
         # --- Compute Paddle Position and Contact ---
-        paddle_index = 15  # paddle belongs to 'right_hand_link'
-        paddle_pos = self.robot.data.body_pos_w[:, paddle_index, :]
+        paddle_pos = self.robot.data.body_pos_w[:, self.paddle_body_id, :]
         # print("paddle_pos: ", paddle_pos[0, :])
         # print("ball_pos: ", self.ball_global_pos[0,:])
 
-        paddle_quat = self.robot.data.body_quat_w[:, paddle_index, :]
+        paddle_quat = self.robot.data.body_quat_w[:, self.paddle_body_id, :]
         # 1) Normalize the quaternion (just in case):
         paddle_quat = paddle_quat / paddle_quat.norm(dim=1, keepdim=True)
-        # 2) Build the local offset (0, -0.345, 0) and expand to (N,3):
-        local_offset = (
-            torch.tensor(
-                [0.0, -0.345, 0.0], # Good to double check.
-                device=paddle_pos.device,
-                dtype=paddle_pos.dtype,
-            )
-            .unsqueeze(0)
-            .expand_as(paddle_pos)
-        )
+        # 2) Build the configured local offset and expand to (N,3):
+        local_offset = self.paddle_local_offset.to(dtype=paddle_pos.dtype).unsqueeze(0).expand_as(paddle_pos)
         rotated_offset: torch.Tensor = math_utils.quat_apply(paddle_quat, local_offset)
         # 4) Compute your touch point:
         self.paddle_touch_point = paddle_pos + rotated_offset # paddle_position in the world frame.
@@ -912,7 +937,7 @@ class TTEnv(VecEnv):
             & (bz >= tcz_min)
             & (bz <= tcz_max)
         )
-        has_touch_own_table_just_now = (
+        self.has_touch_own_table_just_now = (
             (bx >= ncx_min)
             & (bx <= ncx_max)
             & (by >= ncy_min)
@@ -924,13 +949,14 @@ class TTEnv(VecEnv):
         )
         # print(f'env.has_touch_own_table_just_now={has_touch_own_table_just_now}')
         self.has_touch_own_table_prev = (
-            self.has_touch_own_table_prev | has_touch_own_table_just_now
+            self.has_touch_own_table_prev | self.has_touch_own_table_just_now
         )
         self.has_touch_opo_table_prev = (
             self.has_touch_opo_table_prev | self.has_touch_opponent_table_just_now
         )      
         self.has_return_own_table2_prev = (
-            (self.has_touch_own_table_prev & self.has_touch_paddle & has_touch_own_table_just_now) | self.has_return_own_table2_prev
+            (self.has_touch_own_table_prev & self.has_touch_paddle & self.has_touch_own_table_just_now)
+            | self.has_return_own_table2_prev
         )
 
         self.touched_paddel_no_bounce_table=(
@@ -971,9 +997,9 @@ class TTEnv(VecEnv):
         vy = self.ball_linvel[:, 1]
 
         g=9.81
-        body_height=0.69
+        body_height=self.cfg.robot.future_body_height
         vel_max=7.0
-        paddle_y_offset = -0.60
+        paddle_y_offset = self.cfg.robot.future_paddle_y_offset
 
         self.mask_before = (has_bounced == 0).squeeze(-1)
         self.mask_after = (has_bounced == 1).squeeze(-1)

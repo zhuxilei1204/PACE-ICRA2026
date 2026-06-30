@@ -27,6 +27,19 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--predictor", action="store_true", help="Use predictor-augmented runner and train auxiliary predictor")
+parser.add_argument(
+    "--no_load_optimizer",
+    action="store_false",
+    dest="load_optimizer",
+    default=True,
+    help="When resuming, load model weights but skip optimizer state.",
+)
+parser.add_argument(
+    "--reset_policy_noise_std",
+    type=float,
+    default=None,
+    help="After loading a checkpoint, reset the policy action noise std to this value.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -95,7 +108,19 @@ def train():
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path,load_optimizer=True)
+        runner.load(resume_path, load_optimizer=args_cli.load_optimizer)
+        if args_cli.reset_policy_noise_std is not None:
+            policy = runner.alg.policy
+            noise_std = float(args_cli.reset_policy_noise_std)
+            with torch.no_grad():
+                if hasattr(policy, "std"):
+                    policy.std.fill_(noise_std)
+                    print(f"[INFO]: Reset policy std to {noise_std}")
+                elif hasattr(policy, "log_std"):
+                    policy.log_std.fill_(torch.log(torch.tensor(noise_std, device=policy.log_std.device)))
+                    print(f"[INFO]: Reset policy log_std to log({noise_std})")
+                else:
+                    print("[WARN]: Policy has no std/log_std attribute; noise std was not reset.")
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)

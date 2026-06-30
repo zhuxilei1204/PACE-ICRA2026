@@ -63,3 +63,55 @@ def modify_reward_weight_linear(env: TTEnv, env_ids: Sequence[int], term_name: s
         dw = (target_weight - current_weight) / (end_step - global_sim_step_counter)
         term_cfg.weight = current_weight + dw
     env.reward_manager.set_term_cfg(term_name, term_cfg)
+
+
+def modify_ball_ranges_piecewise_linear(env: TTEnv, env_ids: Sequence[int], phases: Sequence[dict], start_step: int = 0):
+    """Linearly expands ball serve ranges across a sequence of curriculum phases."""
+    if not phases:
+        return
+
+    range_keys = (
+        "ball_speed_x_range",
+        "ball_speed_y_range",
+        "ball_speed_z_range",
+        "ball_pos_y_range",
+    )
+    global_sim_step_counter = env.sim_step_counter // env.cfg.sim.decimation
+
+    def apply_ranges(ranges: dict):
+        for key in range_keys:
+            if key in ranges:
+                setattr(env.cfg.ball, key, tuple(ranges[key]))
+
+    def lerp_ranges(start_ranges: dict, target_ranges: dict, alpha: float):
+        alpha = max(0.0, min(1.0, alpha))
+        out = {}
+        for key in range_keys:
+            if key not in target_ranges:
+                continue
+            start_value = start_ranges.get(key, getattr(env.cfg.ball, key))
+            target_value = target_ranges[key]
+            out[key] = tuple(
+                float(s + (t - s) * alpha) for s, t in zip(start_value, target_value)
+            )
+        return out
+
+    first_phase = phases[0]
+    previous_step = int(start_step)
+    previous_ranges = dict(first_phase.get("start", {}))
+    if global_sim_step_counter <= previous_step:
+        apply_ranges(previous_ranges)
+        return
+
+    for phase in phases:
+        end_step = int(phase["end_step"])
+        target_ranges = {key: phase[key] for key in range_keys if key in phase}
+        if global_sim_step_counter <= end_step:
+            denom = max(end_step - previous_step, 1)
+            alpha = (global_sim_step_counter - previous_step) / denom
+            apply_ranges(lerp_ranges(previous_ranges, target_ranges, alpha))
+            return
+        previous_step = end_step
+        previous_ranges.update(target_ranges)
+
+    apply_ranges(previous_ranges)

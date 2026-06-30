@@ -65,6 +65,11 @@ class RobotCfg:
     num_actions: int = 21
     num_joints: int = 21
     effort_limit_scale: float = 1.0
+    paddle_body_name: str = ""
+    paddle_body_index: int = 15
+    paddle_local_offset: tuple = (0.0, -0.345, 0.0)
+    future_body_height: float = 0.69
+    future_paddle_y_offset: float = -0.60
 
 @configclass
 class BallCfg:

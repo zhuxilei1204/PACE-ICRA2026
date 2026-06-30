@@ -11,6 +11,7 @@
 
 import argparse
 import os
+import time
 import numpy as np
 
 import torch
@@ -36,6 +37,71 @@ parser.add_argument(
     action="store_true",
     help="Record observations and actions during play; also plots obs[48:69].",
 )
+parser.add_argument(
+    "--camera_eye",
+    type=float,
+    nargs=3,
+    default=[-3.2, -2.0, 1.6],
+    metavar=("X", "Y", "Z"),
+    help="Viewport camera position for GUI/WebRTC play.",
+)
+parser.add_argument(
+    "--camera_target",
+    type=float,
+    nargs=3,
+    default=[-1.8, 0.35, 0.85],
+    metavar=("X", "Y", "Z"),
+    help="Viewport camera look-at target for GUI/WebRTC play.",
+)
+parser.add_argument(
+    "--keep_camera_interval",
+    type=int,
+    default=1,
+    help="Re-apply the viewport camera every N play steps in GUI/WebRTC mode. Use 0 to disable.",
+)
+parser.add_argument(
+    "--visualize_sleep",
+    type=float,
+    default=None,
+    help="Sleep duration after each rendered play step. Defaults to 0.03s for livestream, 0 for local GUI.",
+)
+parser.add_argument(
+    "--skip_export",
+    action="store_true",
+    help="Skip predictor/JIT/ONNX export before play. Useful for WebRTC visualization.",
+)
+parser.add_argument(
+    "--no_load_runner",
+    action="store_true",
+    help="Do not load checkpoint/runner/policy; useful for isolating WebRTC rendering.",
+)
+parser.add_argument(
+    "--max_play_steps",
+    type=int,
+    default=0,
+    help="Stop play after N environment steps. 0 means run until interrupted.",
+)
+parser.add_argument(
+    "--action_mode",
+    type=str,
+    default="policy",
+    choices=["policy", "zero", "random", "sine"],
+    help="Action source for play visualization.",
+)
+parser.add_argument("--action_std", type=float, default=0.20, help="Action amplitude for random/sine action modes.")
+parser.add_argument("--action_hold_steps", type=int, default=5, help="Hold random actions for this many steps.")
+parser.add_argument("--sine_frequency", type=float, default=0.05, help="Frequency for sine action mode.")
+parser.add_argument(
+    "--disable_predictor_update",
+    action="store_true",
+    help="Do not update predictor visualization state each play step.",
+)
+parser.add_argument(
+    "--warmup_render_steps",
+    type=int,
+    default=None,
+    help="Render this many frames before policy stepping. Defaults to 30 for livestream and 0 otherwise.",
+)
 # parser.add_argument("--check", type=str, default='model_.*.pt', help="checkpoint, defaul the lastest")
 # parser.add_argument("--run", type=str, default='.*', help="experiment run name, defaul the latest run")
 # append RSL-RL cli arguments
@@ -53,6 +119,42 @@ from isaaclab_tasks.utils import get_checkpoint_path
 
 from legged_lab.envs import *  # noqa:F401, F403
 from legged_lab.utils.cli_args import update_rsl_rl_cfg
+
+
+def _set_camera_view(env) -> None:
+    eye = torch.tensor(args_cli.camera_eye, dtype=torch.float32, device=env.device)
+    target = torch.tensor(args_cli.camera_target, dtype=torch.float32, device=env.device)
+    if getattr(env.scene, "env_origins", None) is not None and env.scene.env_origins.numel() > 0:
+        origin = env.scene.env_origins[0]
+        eye = eye + origin
+        target = target + origin
+    env.sim.set_camera_view(eye.detach().cpu().tolist(), target.detach().cpu().tolist())
+
+
+def _refresh_visualization(env, visualize_sleep: float, *, force_camera: bool = False) -> None:
+    if force_camera:
+        _set_camera_view(env)
+    env.sim.render()
+    if hasattr(simulation_app, "update"):
+        simulation_app.update()
+    if visualize_sleep > 0.0:
+        time.sleep(visualize_sleep)
+
+
+def _make_debug_actions(env, step: int, current_actions: torch.Tensor) -> torch.Tensor:
+    if args_cli.action_mode == "zero":
+        return torch.zeros_like(current_actions)
+    if args_cli.action_mode == "random":
+        if step % max(1, args_cli.action_hold_steps) == 1:
+            return torch.clamp(args_cli.action_std * torch.randn_like(current_actions), -1.0, 1.0)
+        return current_actions
+    if args_cli.action_mode == "sine":
+        phase = float(step) * args_cli.sine_frequency
+        action = args_cli.action_std * torch.sin(
+            phase + torch.arange(env.num_actions, device=env.device, dtype=torch.float32)
+        )
+        return action.unsqueeze(0).repeat(env.num_envs, 1)
+    raise ValueError(f"Unsupported action_mode for debug actions: {args_cli.action_mode}")
 
 
 def play():
@@ -90,50 +192,84 @@ def play():
     agent_cfg = update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.seed = agent_cfg.seed
 
+    livestream_mode = int(getattr(args_cli, "livestream", 0) or 0)
+    env_headless = bool(args_cli.headless)
+    if livestream_mode > 0:
+        env_headless = False
     env_class = task_registry.get_task_class(env_class_name)
-    env = env_class(env_cfg, args_cli.headless)
+    env = env_class(env_cfg, env_headless)
+    print(
+        f"[INFO] Play render mode: args_headless={args_cli.headless}, "
+        f"env_headless={env_headless}, livestream={livestream_mode}"
+    )
+    visualize_mode = (not args_cli.headless) or livestream_mode > 0
+    visualize_sleep = args_cli.visualize_sleep
+    if visualize_sleep is None:
+        visualize_sleep = 0.03 if livestream_mode > 0 else 0.0
+    warmup_render_steps = args_cli.warmup_render_steps
+    if warmup_render_steps is None:
+        warmup_render_steps = 30 if livestream_mode > 0 else 0
+    if visualize_mode:
+        try:
+            _set_camera_view(env)
+            print(f"[INFO] Camera view set: eye={args_cli.camera_eye}, target={args_cli.camera_target}")
+            for _ in range(max(0, warmup_render_steps)):
+                _refresh_visualization(env, visualize_sleep, force_camera=True)
+        except Exception as exc:
+            print(f"[WARN] Failed to set camera view: {exc}")
 
     log_root_path = os.path.join("logs", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     # agent_cfg.load_run=args_cli.run
     # agent_cfg.load_checkpoint=args_cli.checkpoint
-    print(f"\n[INFO] Loading experiment from directory: {log_root_path}")
-    print(f'agent_cfg.load_run:{agent_cfg.load_run}')
-    print(f'agent_cfg.load_checkpoint:{agent_cfg.load_checkpoint}\n')
-    # resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-    resume_path = get_checkpoint_path(log_root_path, args_cli.load_run, args_cli.checkpoint)
-    log_dir = os.path.dirname(resume_path)
-
-    # Choose runner implementation
-    if args_cli.predictor:
-        from rsl_rl.rsl_rl.runners import OnPolicyPredictorRegressionRunner
-        runner = OnPolicyPredictorRegressionRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    runner = None
+    policy = None
+    log_dir = log_root_path
+    if args_cli.no_load_runner:
+        if args_cli.action_mode == "policy":
+            raise ValueError("--no_load_runner requires --action_mode to be zero, random, or sine.")
+        print("[INFO] Skipping runner/checkpoint/policy loading before play.")
     else:
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
-    runner.load(resume_path, load_optimizer=False)
+        print(f"\n[INFO] Loading experiment from directory: {log_root_path}")
+        print(f'agent_cfg.load_run:{agent_cfg.load_run}')
+        print(f'agent_cfg.load_checkpoint:{agent_cfg.load_checkpoint}\n')
+        # resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        resume_path = get_checkpoint_path(log_root_path, args_cli.load_run, args_cli.checkpoint)
+        log_dir = os.path.dirname(resume_path)
 
-    policy = runner.get_inference_policy(device=env.device)
+        # Choose runner implementation
+        if args_cli.predictor:
+            from rsl_rl.rsl_rl.runners import OnPolicyPredictorRegressionRunner
+            runner = OnPolicyPredictorRegressionRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        else:
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner.load(resume_path, load_optimizer=False)
 
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    os.makedirs(export_model_dir, exist_ok=True)
-    # Export predictor weights only when predictor-augmented runner is used
-    if args_cli.predictor:
-        # Save predictor as generic TorchScript module (policy-specific exporter not applicable)
-        # Move to CPU before scripting/saving to avoid CUDA dependency during load.
-        try:
-            orig_device = next(runner._predictor.parameters()).device
-        except StopIteration:
-            orig_device = torch.device("cpu")
-        runner._predictor.to("cpu").eval()
-        ts_predictor = torch.jit.script(runner._predictor)
-        ts_predictor.save(os.path.join(export_model_dir, "predictor.pt"))
-        # Restore original device for runtime
-        runner._predictor.to(orig_device)
-    # Export policy in both JIT and ONNX formats
-    export_policy_as_jit(runner.alg.policy, runner.obs_normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(
-        runner.alg.policy, normalizer=runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
-    )
+        policy = runner.get_inference_policy(device=env.device)
+
+        if args_cli.skip_export:
+            print("[INFO] Skipping predictor/JIT/ONNX export before play.")
+        else:
+            export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+            os.makedirs(export_model_dir, exist_ok=True)
+            # Export predictor weights only when predictor-augmented runner is used
+            if args_cli.predictor:
+                # Save predictor as generic TorchScript module (policy-specific exporter not applicable)
+                # Move to CPU before scripting/saving to avoid CUDA dependency during load.
+                try:
+                    orig_device = next(runner._predictor.parameters()).device
+                except StopIteration:
+                    orig_device = torch.device("cpu")
+                runner._predictor.to("cpu").eval()
+                ts_predictor = torch.jit.script(runner._predictor)
+                ts_predictor.save(os.path.join(export_model_dir, "predictor.pt"))
+                # Restore original device for runtime
+                runner._predictor.to(orig_device)
+            # Export policy in both JIT and ONNX formats
+            export_policy_as_jit(runner.alg.policy, runner.obs_normalizer, path=export_model_dir, filename="policy.pt")
+            export_policy_as_onnx(
+                runner.alg.policy, normalizer=runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
+            )
 
     if not args_cli.headless:
         from legged_lab.utils.keyboard import Keyboard
@@ -158,12 +294,19 @@ def play():
         serve_success_flag = None
         serve_hit_flag = None
     step_count = 0
+    debug_actions = torch.zeros(env.num_envs, env.num_actions, device=env.device)
 
     try:
         while simulation_app.is_running():
 
             with torch.inference_mode():
-                actions = policy(obs)
+                if args_cli.action_mode == "policy":
+                    if policy is None:
+                        raise RuntimeError("Policy action mode requires a loaded runner/policy.")
+                    actions = policy(obs)
+                else:
+                    debug_actions = _make_debug_actions(env, step_count + 1, debug_actions)
+                    actions = debug_actions
                 # Record inputs/outputs of policy inference for env 0
                 if record_action:
                     try:
@@ -186,8 +329,16 @@ def play():
                     except Exception:
                         pass
                 obs, _, _, _ = env.step(actions)
+                if visualize_mode:
+                    try:
+                        if args_cli.keep_camera_interval > 0 and step_count % args_cli.keep_camera_interval == 0:
+                            _refresh_visualization(env, visualize_sleep, force_camera=True)
+                        else:
+                            _refresh_visualization(env, visualize_sleep)
+                    except Exception as exc:
+                        print(f"[WARN] Failed to refresh GUI/WebRTC render: {exc}")
                 # If predictor runner is used, update learned prediction each step for visualization/observations
-                if args_cli.predictor:
+                if args_cli.predictor and not args_cli.disable_predictor_update:
                     try:
                         runner._record_ball_positions()
                         runner._maybe_predict_and_update_env()
@@ -224,6 +375,9 @@ def play():
                 except Exception:
                     pass
                 step_count += 1
+                if args_cli.max_play_steps > 0 and step_count >= args_cli.max_play_steps:
+                    print(f"[INFO] Reached max_play_steps={args_cli.max_play_steps}.")
+                    break
                 if step_count % 50 == 0:
                     succ_rate = (succ_total / serve_total) if serve_total > 0 else 0.0
                     hit_rate = (hit_total / serve_total) if serve_total > 0 else 0.0

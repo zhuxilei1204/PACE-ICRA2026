@@ -614,6 +614,93 @@ def reward_table_success(env: TTEnv) -> torch.Tensor:
     rew_table_success = (env.has_touch_paddle.float() * env.has_touch_opponent_table_just_now.float())
     return rew_table_success
 
+
+def reward_opponent_table_after_paddle_hit_target(
+    env: TTEnv,
+    target_x: float = 1.15,
+    target_y: float = 0.0,
+    x_std: float = 0.7,
+    y_std: float = 0.5,
+) -> torch.Tensor:
+    """One-shot actual opponent-table landing reward with a landing-location score."""
+    hit_opponent = env.has_touch_paddle & env.has_touch_opponent_table_just_now
+    x_err = torch.abs(env.ball_pos[:, 0] - target_x)
+    y_err = torch.abs(env.ball_pos[:, 1] - target_y)
+    x_score = torch.exp(-x_err / (x_std + 1e-12))
+    y_score = torch.exp(-y_err / (y_std + 1e-12))
+    reward = x_score * y_score
+    reward = torch.where(hit_opponent, reward, torch.zeros_like(reward))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def penalty_own_table_after_paddle_hit(env: TTEnv) -> torch.Tensor:
+    """One-shot failure signal when a post-paddle ball lands on the own table."""
+    own_table_now = getattr(env, "has_touch_own_table_just_now", torch.zeros_like(env.has_touch_paddle))
+    penalty = env.has_touch_paddle & own_table_now & ~env.has_touch_opo_table_prev
+    return penalty.float()
+
+
+def penalty_hit_low_base_reset(env: TTEnv, min_base_z: float = 0.50) -> torch.Tensor:
+    """Penalize policies that get a hit only by falling into a low-base reset."""
+    reset_buf = getattr(env, "reset_buf", torch.zeros_like(env.has_touch_paddle))
+    low_base = env.robot_pos[:, 2] < min_base_z
+    penalty = env.has_touch_paddle & reset_buf & low_base
+    return penalty.float()
+
+
+def penalty_post_hit_low_base(
+    env: TTEnv,
+    min_base_z: float = 0.54,
+    std: float = 0.06,
+    max_penalty: float = 1.0,
+) -> torch.Tensor:
+    """Dense post-hit penalty for policies that lower the base toward reset."""
+    deficit = torch.clamp((min_base_z - env.robot_pos[:, 2]) / (std + 1e-12), min=0.0, max=max_penalty)
+    return torch.where(env.has_touch_paddle, deficit, torch.zeros_like(deficit))
+
+
+def penalty_post_hit_trajectory_excess(
+    env: TTEnv,
+    min_vx: float = 0.1,
+    net_x: float = 0.0,
+    max_z_at_net: float = 1.30,
+    z_std: float = 0.35,
+    vy_limit: float = 1.20,
+    vy_std: float = 1.50,
+    max_t_net: float = 1.40,
+    max_reward_x: float = -0.95,
+    z_weight: float = 0.55,
+    vy_weight: float = 0.45,
+) -> torch.Tensor:
+    """Dense post-hit penalty for over-lifted or side-spun ball trajectories."""
+    x = env.ball_pos[:, 0]
+    z = env.ball_pos[:, 2]
+    vx = env.ball_linvel[:, 0]
+    vy = env.ball_linvel[:, 1]
+    vz = env.ball_linvel[:, 2]
+
+    hit_before_table = getattr(
+        env,
+        "touched_paddel_no_bounce_table",
+        env.has_touch_paddle
+        & ~getattr(env, "has_touch_own_table_prev", torch.zeros_like(env.has_touch_paddle))
+        & ~getattr(env, "has_touch_opo_table_prev", torch.zeros_like(env.has_touch_paddle)),
+    )
+    moving_forward = vx > min_vx
+
+    dx_to_net = torch.clamp(net_x - x, min=0.0)
+    vx_safe = torch.clamp(vx, min=min_vx)
+    t_net = torch.clamp(dx_to_net / vx_safe, min=0.0, max=max_t_net)
+    z_at_net = torch.where(x < net_x, z + vz * t_net - 0.5 * 9.81 * t_net * t_net, z)
+
+    z_penalty = torch.clamp((z_at_net - max_z_at_net) / (z_std + 1e-12), min=0.0, max=1.0)
+    vy_penalty = torch.clamp((torch.abs(vy) - vy_limit) / (vy_std + 1e-12), min=0.0, max=1.0)
+    penalty = (z_weight * z_penalty + vy_weight * vy_penalty) / (z_weight + vy_weight + 1e-12)
+
+    active = hit_before_table & moving_forward & (x <= max_reward_x)
+    penalty = torch.where(active, penalty, torch.zeros_like(penalty))
+    return torch.nan_to_num(penalty, nan=0.0, posinf=0.0, neginf=0.0)
+
 # # (5) Encourage forward ball position.
 # def reward_ball_pos(env: TTEnv) -> torch.Tensor:
 
@@ -655,6 +742,19 @@ def reward_paddle_distance_terminal_weighted(env: TTEnv, coeff_x: float=100.0, c
     reward_z = weight_z / (1 + coeff_z * d_z**2)**2
     reward = reward_x + reward_y + reward_z
     return torch.where(env.mask_terminal, torch.zeros_like(reward), reward)
+
+def reward_future_touch_point_target(
+    env: TTEnv,
+    std_ee: float = 0.5,
+    threshold: float = 0.03,
+) -> torch.Tensor:
+    paddle_touch_point = env.paddle_touch_point - env.scene.env_origins
+    distance = torch.linalg.norm(env.ball_future_pose - paddle_touch_point, dim=1)
+    denom_ee = std_ee * std_ee + 1e-12
+    reward_touch_point = torch.exp(-torch.clamp(distance, min=threshold) / denom_ee)
+    reward_touch_point = torch.where(env.mask_invalid, torch.zeros_like(reward_touch_point), reward_touch_point)
+    reward = torch.nan_to_num(reward_touch_point, nan=0.0, posinf=0.0, neginf=0.0)
+    return reward
 
 def reward_future_ee_target(
     env: TTEnv,
@@ -758,6 +858,290 @@ def reward_future_landing_dis(
     reward = torch.where(mask, reward, torch.zeros_like(reward)) # sparse
     return reward
 
+
+def reward_future_opponent_landing_target(
+    env: TTEnv,
+    target_x: float = 1.15,
+    target_y: float = 0.0,
+    min_x: float = 0.0,
+    std: float = 1.0,
+) -> torch.Tensor:
+    """Reward first post-hit predicted landing only on the opponent half.
+
+    This is used by the A3 migration to avoid rewarding balls that are hit back
+    onto the robot's own table side.
+    """
+    pred_land = torch.stack([env.predict_x_land, env.predict_y_land], dim=1)
+    target_land = torch.tensor([target_x, target_y], device=pred_land.device, dtype=pred_land.dtype)
+    dist = torch.linalg.norm(pred_land - target_land, dim=1)
+    reward = torch.exp(-dist / (std * std + 1e-12))
+    valid = env.ball_landing_dis_rew & torch.isfinite(dist) & (env.predict_x_land > min_x)
+    reward = torch.where(valid, reward, torch.zeros_like(reward))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def penalty_future_own_landing_after_hit(
+    env: TTEnv,
+    max_x: float = 0.0,
+) -> torch.Tensor:
+    """Flag first post-hit predicted landings on the robot's own table side."""
+    valid_prediction = torch.isfinite(env.predict_x_land) & torch.isfinite(env.predict_y_land)
+    own_side = env.predict_x_land <= max_x
+    penalty = env.ball_landing_dis_rew & valid_prediction & own_side
+    return penalty.float()
+
+
+def reward_future_landing_x_progress(
+    env: TTEnv,
+    min_x: float = -1.5,
+    target_x: float = 1.15,
+    target_y: float = 0.0,
+    y_std: float = 1.0,
+    y_weight: float = 0.25,
+) -> torch.Tensor:
+    """Dense first-hit curriculum for moving predicted landing toward +x."""
+    valid_prediction = torch.isfinite(env.predict_x_land) & torch.isfinite(env.predict_y_land)
+    x_progress = (env.predict_x_land - min_x) / (target_x - min_x + 1e-12)
+    x_progress = torch.clamp(x_progress, min=0.0, max=1.0)
+    y_score = torch.exp(-torch.abs(env.predict_y_land - target_y) / (y_std + 1e-12))
+    reward = x_progress * ((1.0 - y_weight) + y_weight * y_score)
+    valid = env.ball_landing_dis_rew & valid_prediction
+    reward = torch.where(valid, reward, torch.zeros_like(reward))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_hit_ball_velocity_net_target(
+    env: TTEnv,
+    vx_target: float = 3.0,
+    vz_target: float = 1.5,
+    z_target: float = 1.05,
+    z_std: float = 0.35,
+    min_vx: float = 0.1,
+    max_t_net: float = 1.4,
+    t_std: float = 0.7,
+    vx_weight: float = 0.45,
+    vz_weight: float = 0.25,
+    z_weight: float = 0.20,
+    t_weight: float = 0.10,
+) -> torch.Tensor:
+    """Stage reward for the first post-hit ball velocity and net-height potential.
+
+    This is intended for A3 early training only: it does not replace real pass-net
+    or table-success rewards.  The reward is sparse at the first hit event but
+    gives a continuous score for whether that hit sends the ball forward and on a
+    plausible trajectory toward the net.
+    """
+    x = env.ball_pos[:, 0]
+    z = env.ball_pos[:, 2]
+    vx = env.ball_linvel[:, 0]
+    vz = env.ball_linvel[:, 2]
+
+    moving_forward = vx > min_vx
+    dx_to_net = torch.clamp(0.0 - x, min=0.0)
+    vx_safe = torch.clamp(vx, min=min_vx)
+    t_net_raw = dx_to_net / vx_safe
+    t_net = torch.clamp(t_net_raw, min=0.0, max=max_t_net)
+    z_at_net = z + vz * t_net - 0.5 * 9.81 * t_net * t_net
+
+    vx_score = torch.clamp(vx / (vx_target + 1e-12), min=0.0, max=1.0)
+    vz_score = torch.clamp(vz / (vz_target + 1e-12), min=0.0, max=1.0)
+    z_score = torch.exp(-torch.abs(z_at_net - z_target) / (z_std + 1e-12))
+    time_score = torch.exp(-torch.clamp(t_net_raw - max_t_net, min=0.0) / (t_std + 1e-12))
+    denom = vx_weight + vz_weight + z_weight + t_weight + 1e-12
+    reward = (
+        vx_weight * vx_score
+        + vz_weight * vz_score
+        + z_weight * z_score
+        + t_weight * time_score
+    ) / denom
+
+    mask = env.ball_landing_dis_rew & moving_forward
+    reward = torch.where(mask, reward, torch.zeros_like(reward))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_hit_net_clearance_progress(
+    env: TTEnv,
+    min_vx: float = 0.1,
+    vx_target: float = 2.5,
+    min_z: float = 0.76,
+    target_z: float = 1.05,
+    z_std: float = 0.45,
+    max_t_net: float = 1.8,
+    t_std: float = 0.8,
+    vx_weight: float = 0.65,
+    time_weight: float = 0.35,
+) -> torch.Tensor:
+    """Dense first-hit score for lifting the ball toward net clearance."""
+    x = env.ball_pos[:, 0]
+    z = env.ball_pos[:, 2]
+    vx = env.ball_linvel[:, 0]
+    vz = env.ball_linvel[:, 2]
+
+    moving_forward = vx > min_vx
+    dx_to_net = torch.clamp(0.0 - x, min=0.0)
+    vx_safe = torch.clamp(vx, min=min_vx)
+    t_net_raw = dx_to_net / vx_safe
+    t_net = torch.clamp(t_net_raw, min=0.0, max=max_t_net)
+    z_at_net = z + vz * t_net - 0.5 * 9.81 * t_net * t_net
+
+    height_deficit = torch.clamp(target_z - z_at_net, min=0.0)
+    height_score = torch.exp(-height_deficit / (z_std + 1e-12))
+    height_score = torch.where(z_at_net >= min_z, height_score, 0.25 * height_score)
+    vx_score = torch.clamp(vx / (vx_target + 1e-12), min=0.0, max=1.0)
+    time_score = torch.exp(-torch.clamp(t_net_raw - max_t_net, min=0.0) / (t_std + 1e-12))
+    denom = vx_weight + time_weight + 1e-12
+    forward_score = (vx_weight * vx_score + time_weight * time_score) / denom
+
+    reward = height_score * forward_score
+    mask = env.ball_landing_dis_rew & moving_forward
+    reward = torch.where(mask, reward, torch.zeros_like(reward))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_post_hit_net_progress(
+    env: TTEnv,
+    min_vx: float = 0.1,
+    vx_target: float = 3.5,
+    vz_target: float = 1.6,
+    x_start: float = -1.45,
+    max_reward_x: float = 0.15,
+    net_x: float = 0.0,
+    net_z_target: float = 1.08,
+    min_clear_z: float = 0.78,
+    z_std: float = 0.45,
+    max_t_net: float = 1.4,
+    landing_min_x: float = -1.5,
+    landing_target_x: float = 1.15,
+    y_target: float = 0.0,
+    y_std: float = 0.75,
+    vy_std: float = 2.0,
+    vx_weight: float = 0.25,
+    vz_weight: float = 0.0,
+    x_weight: float = 0.20,
+    z_weight: float = 0.20,
+    landing_weight: float = 0.25,
+    y_weight: float = 0.10,
+) -> torch.Tensor:
+    """Dense A3 post-hit curriculum before the first table bounce.
+
+    Most existing table-tennis rewards fire only on the first hit frame.  A3's
+    useful hit window is narrower than T1's, so this reward keeps a short
+    trajectory signal alive after paddle contact and before the first table
+    contact.  It is generic, but only enabled by A3 stage configs.
+    """
+    x = env.ball_pos[:, 0]
+    y = env.ball_pos[:, 1]
+    z = env.ball_pos[:, 2]
+    vx = env.ball_linvel[:, 0]
+    vy = env.ball_linvel[:, 1]
+    vz = env.ball_linvel[:, 2]
+
+    hit_before_table = getattr(
+        env,
+        "touched_paddel_no_bounce_table",
+        env.has_touch_paddle
+        & ~getattr(env, "has_touch_own_table_prev", torch.zeros_like(env.has_touch_paddle))
+        & ~getattr(env, "has_touch_opo_table_prev", torch.zeros_like(env.has_touch_paddle)),
+    )
+    moving_forward = vx > min_vx
+
+    vx_score = torch.clamp(vx / (vx_target + 1e-12), min=0.0, max=1.0)
+    vz_score = torch.clamp(vz / (vz_target + 1e-12), min=0.0, max=1.0)
+    x_score = torch.clamp((x - x_start) / (net_x - x_start + 1e-12), min=0.0, max=1.0)
+
+    dx_to_net = torch.clamp(net_x - x, min=0.0)
+    vx_safe = torch.clamp(vx, min=min_vx)
+    t_net = torch.clamp(dx_to_net / vx_safe, min=0.0, max=max_t_net)
+    z_at_net = torch.where(x < net_x, z + vz * t_net - 0.5 * 9.81 * t_net * t_net, z)
+    height_score = torch.exp(-torch.abs(z_at_net - net_z_target) / (z_std + 1e-12))
+    height_score = torch.where(z_at_net >= min_clear_z, height_score, 0.25 * height_score)
+
+    pred_land_x = getattr(env, "predict_x_land", torch.full_like(x, float("nan")))
+    landing_score = torch.clamp(
+        (pred_land_x - landing_min_x) / (landing_target_x - landing_min_x + 1e-12),
+        min=0.0,
+        max=1.0,
+    )
+    landing_score = torch.where(torch.isfinite(pred_land_x), landing_score, torch.zeros_like(landing_score))
+
+    y_pos_score = torch.exp(-torch.abs(y - y_target) / (y_std + 1e-12))
+    y_vel_score = torch.exp(-torch.abs(vy) / (vy_std + 1e-12))
+    y_score = 0.5 * (y_pos_score + y_vel_score)
+
+    denom = vx_weight + vz_weight + x_weight + z_weight + landing_weight + y_weight + 1e-12
+    reward = (
+        vx_weight * vx_score
+        + vz_weight * vz_score
+        + x_weight * x_score
+        + z_weight * height_score
+        + landing_weight * landing_score
+        + y_weight * y_score
+    ) / denom
+
+    active = hit_before_table & moving_forward & (x <= max_reward_x)
+    reward = torch.where(active, reward, torch.zeros_like(reward))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_post_hit_ballistic_landing_target(
+    env: TTEnv,
+    table_z: float = 0.78,
+    target_x: float = 1.15,
+    target_y: float = 0.0,
+    x_std: float = 0.85,
+    y_std: float = 0.55,
+    min_vx: float = 0.1,
+    min_x: float = 0.0,
+    max_x: float = 2.7,
+    max_abs_y: float = 0.9,
+    max_t_land: float = 1.4,
+) -> torch.Tensor:
+    """Dense A3 post-hit reward for estimated opponent-table landing.
+
+    The estimate is intentionally simple and local: after paddle contact, use
+    the current ball position/velocity to estimate the first crossing of table
+    height.  This complements sparse actual table-success rewards without
+    depending on the learned ball predictor.
+    """
+    x = env.ball_pos[:, 0]
+    y = env.ball_pos[:, 1]
+    z = env.ball_pos[:, 2]
+    vx = env.ball_linvel[:, 0]
+    vy = env.ball_linvel[:, 1]
+    vz = env.ball_linvel[:, 2]
+
+    hit_before_table = getattr(
+        env,
+        "touched_paddel_no_bounce_table",
+        env.has_touch_paddle
+        & ~getattr(env, "has_touch_own_table_prev", torch.zeros_like(env.has_touch_paddle))
+        & ~getattr(env, "has_touch_opo_table_prev", torch.zeros_like(env.has_touch_paddle)),
+    )
+
+    g = 9.81
+    discriminant = vz * vz + 2.0 * g * (z - table_z)
+    valid_height = discriminant >= 0.0
+    sqrt_d = torch.sqrt(torch.clamp(discriminant, min=0.0))
+    t_land = (vz + sqrt_d) / g
+    valid_time = (t_land >= 0.0) & (t_land <= max_t_land)
+    x_land = x + vx * t_land
+    y_land = y + vy * t_land
+
+    x_score = torch.exp(-torch.abs(x_land - target_x) / (x_std + 1e-12))
+    y_score = torch.exp(-torch.abs(y_land - target_y) / (y_std + 1e-12))
+    reward = x_score * y_score
+
+    valid_landing = (
+        (x_land >= min_x)
+        & (x_land <= max_x)
+        & (torch.abs(y_land) <= max_abs_y)
+    )
+    active = hit_before_table & (vx > min_vx) & valid_height & valid_time & valid_landing
+    reward = torch.where(active, reward, torch.zeros_like(reward))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def reward_future_pass_net(
     env: TTEnv,
     std_h : float = 0.06,
@@ -795,6 +1179,349 @@ def reward_future_pass_net(
     mask = env.ball_landing_dis_rew
     reward = torch.where(mask, reward, torch.zeros_like(reward))  # sparse
     return reward
+
+
+def _resolve_scene_entity_cfg(env: TTEnv, cfg: SceneEntityCfg | None) -> SceneEntityCfg | None:
+    if cfg is None:
+        return None
+    body_ids = getattr(cfg, "body_ids", None)
+    if body_ids is None or body_ids == slice(None):
+        cfg.resolve(env.scene)
+    return cfg
+
+
+def _a3_stability_scores(
+    env: TTEnv,
+    feet_sensor_cfg: SceneEntityCfg | None = None,
+    bad_contact_sensor_cfg: SceneEntityCfg | None = None,
+    feet_asset_cfg: SceneEntityCfg | None = None,
+    min_base_z: float = 0.72,
+    max_base_z: float = 1.18,
+    height_std: float = 0.18,
+    upright_std: float = 0.35,
+    lin_vel_std: float = 1.20,
+    ang_vel_std: float = 2.00,
+    contact_force_threshold: float = 1.0,
+    force_balance_std: float = 0.65,
+    bad_contact_threshold: float = 1.0,
+    bad_contact_std: float = 1.0,
+    target_feet_width: float = 0.42,
+    feet_width_std: float = 0.22,
+) -> dict[str, torch.Tensor]:
+    asset: Articulation = env.scene["robot"]
+    device = env.device
+    dtype = asset.data.root_pos_w.dtype
+    feet_sensor_cfg = _resolve_scene_entity_cfg(env, feet_sensor_cfg)
+    bad_contact_sensor_cfg = _resolve_scene_entity_cfg(env, bad_contact_sensor_cfg)
+    feet_asset_cfg = _resolve_scene_entity_cfg(env, feet_asset_cfg)
+
+    root_z = getattr(env, "robot_pos", asset.data.root_pos_w - env.scene.env_origins)[:, 2]
+    low_deficit = torch.clamp(min_base_z - root_z, min=0.0)
+    high_excess = torch.clamp(root_z - max_base_z, min=0.0)
+    height_score = torch.exp(-(low_deficit.square() + high_excess.square()) / (height_std * height_std + 1e-12))
+
+    upright_error = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+    upright_score = torch.exp(-upright_error / (upright_std * upright_std + 1e-12))
+
+    lin_vel_xy = torch.norm(asset.data.root_lin_vel_w[:, :2], dim=1)
+    ang_vel_xy = torch.norm(asset.data.root_ang_vel_b[:, :2], dim=1)
+    velocity_error = (
+        lin_vel_xy.square() / (lin_vel_std * lin_vel_std + 1e-12)
+        + ang_vel_xy.square() / (ang_vel_std * ang_vel_std + 1e-12)
+    )
+    low_velocity_score = torch.exp(-velocity_error)
+
+    support_score = torch.ones(env.num_envs, device=device, dtype=dtype)
+    if feet_sensor_cfg is None:
+        feet_sensor_cfg = getattr(env, "feet_cfg", None)
+    if feet_sensor_cfg is not None:
+        contact_sensor: ContactSensor = env.scene.sensors[feet_sensor_cfg.name]
+        foot_forces = (
+            contact_sensor.data.net_forces_w_history[:, :, feet_sensor_cfg.body_ids, :]
+            .norm(dim=-1)
+            .max(dim=1)[0]
+        )
+        foot_contacts = foot_forces > contact_force_threshold
+        contact_count = torch.sum(foot_contacts.int(), dim=1)
+        if foot_forces.shape[1] >= 2:
+            force_sum = foot_forces[:, 0] + foot_forces[:, 1] + 1e-12
+            force_ratio_diff = torch.abs(foot_forces[:, 0] - foot_forces[:, 1]) / force_sum
+            force_balance_score = torch.exp(
+                -force_ratio_diff.square() / (force_balance_std * force_balance_std + 1e-12)
+            )
+        else:
+            force_balance_score = torch.ones_like(support_score)
+        support_score = torch.full_like(support_score, 0.05)
+        support_score = torch.where(contact_count == 1, torch.full_like(support_score, 0.65), support_score)
+        both_support_score = 0.75 + 0.25 * force_balance_score
+        support_score = torch.where(contact_count >= 2, both_support_score, support_score)
+
+    contact_clean_score = torch.ones(env.num_envs, device=device, dtype=dtype)
+    if bad_contact_sensor_cfg is not None:
+        contact_sensor = env.scene.sensors[bad_contact_sensor_cfg.name]
+        bad_forces = (
+            contact_sensor.data.net_forces_w_history[:, :, bad_contact_sensor_cfg.body_ids, :]
+            .norm(dim=-1)
+            .max(dim=1)[0]
+        )
+        bad_contact_count = torch.sum((bad_forces > bad_contact_threshold).float(), dim=1)
+        contact_clean_score = torch.exp(-bad_contact_count / (bad_contact_std + 1e-12))
+
+    feet_width_score = torch.ones(env.num_envs, device=device, dtype=dtype)
+    if feet_asset_cfg is not None:
+        feet_pos = asset.data.body_pos_w[:, feet_asset_cfg.body_ids, :2]
+        if feet_pos.shape[1] >= 2:
+            feet_width = torch.norm(feet_pos[:, 0] - feet_pos[:, 1], dim=1)
+            feet_width_score = torch.exp(
+                -(feet_width - target_feet_width).square() / (feet_width_std * feet_width_std + 1e-12)
+            )
+
+    return {
+        "height": torch.nan_to_num(height_score, nan=0.0, posinf=0.0, neginf=0.0),
+        "upright": torch.nan_to_num(upright_score, nan=0.0, posinf=0.0, neginf=0.0),
+        "support": torch.nan_to_num(support_score, nan=0.0, posinf=0.0, neginf=0.0),
+        "velocity": torch.nan_to_num(low_velocity_score, nan=0.0, posinf=0.0, neginf=0.0),
+        "clean": torch.nan_to_num(contact_clean_score, nan=0.0, posinf=0.0, neginf=0.0),
+        "feet_width": torch.nan_to_num(feet_width_score, nan=0.0, posinf=0.0, neginf=0.0),
+    }
+
+
+def _a3_stability_raw_score(
+    env: TTEnv,
+    height_weight: float = 0.28,
+    upright_weight: float = 0.24,
+    support_weight: float = 0.20,
+    velocity_weight: float = 0.14,
+    clean_weight: float = 0.09,
+    feet_width_weight: float = 0.05,
+    **score_kwargs,
+) -> torch.Tensor:
+    scores = _a3_stability_scores(env, **score_kwargs)
+    weighted_scores = (
+        (scores["height"], height_weight),
+        (scores["upright"], upright_weight),
+        (scores["support"], support_weight),
+        (scores["velocity"], velocity_weight),
+        (scores["clean"], clean_weight),
+        (scores["feet_width"], feet_width_weight),
+    )
+    total_weight = sum(weight for _, weight in weighted_scores) + 1e-12
+    log_score = torch.zeros(env.num_envs, device=env.device, dtype=scores["height"].dtype)
+    for score, weight in weighted_scores:
+        log_score = log_score + (weight / total_weight) * torch.log(torch.clamp(score, min=1e-3, max=1.0))
+    return torch.exp(log_score)
+
+
+def _clean_a3_stability_score_kwargs(score_kwargs: dict | None) -> dict:
+    return {} if score_kwargs is None else dict(score_kwargs)
+
+
+def a3_stability_gate(
+    env: TTEnv,
+    gate_floor: float = 0.20,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    raw_score = _a3_stability_raw_score(env, **_clean_a3_stability_score_kwargs(score_kwargs))
+    gate = gate_floor + (1.0 - gate_floor) * raw_score
+    return torch.clamp(torch.nan_to_num(gate, nan=gate_floor, posinf=1.0, neginf=gate_floor), min=gate_floor, max=1.0)
+
+
+def reward_standing_stability(
+    env: TTEnv,
+    height_weight: float = 0.28,
+    upright_weight: float = 0.24,
+    support_weight: float = 0.20,
+    velocity_weight: float = 0.14,
+    clean_weight: float = 0.09,
+    feet_width_weight: float = 0.05,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    score_params = _clean_a3_stability_score_kwargs(score_kwargs)
+    height_weight = score_params.pop("height_weight", height_weight)
+    upright_weight = score_params.pop("upright_weight", upright_weight)
+    support_weight = score_params.pop("support_weight", support_weight)
+    velocity_weight = score_params.pop("velocity_weight", velocity_weight)
+    clean_weight = score_params.pop("clean_weight", clean_weight)
+    feet_width_weight = score_params.pop("feet_width_weight", feet_width_weight)
+    scores = _a3_stability_scores(env, **score_params)
+    total_weight = height_weight + upright_weight + support_weight + velocity_weight + clean_weight + feet_width_weight + 1e-12
+    reward = (
+        height_weight * scores["height"]
+        + upright_weight * scores["upright"]
+        + support_weight * scores["support"]
+        + velocity_weight * scores["velocity"]
+        + clean_weight * scores["clean"]
+        + feet_width_weight * scores["feet_width"]
+    ) / total_weight
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def penalty_unstable_hit(env: TTEnv, score_kwargs: dict | None = None) -> torch.Tensor:
+    raw_score = _a3_stability_raw_score(env, **_clean_a3_stability_score_kwargs(score_kwargs))
+    penalty = env.ball_contact_rew.float() * (1.0 - raw_score)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _apply_a3_stability_gate(
+    env: TTEnv,
+    reward: torch.Tensor,
+    gate_floor: float,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    gate = a3_stability_gate(env, gate_floor=gate_floor, score_kwargs=score_kwargs)
+    return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_contact_stability_gated(
+    env: TTEnv,
+    gate_floor: float = 0.30,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    return _apply_a3_stability_gate(env, reward_contact(env), gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_future_touch_point_target_stability_gated(
+    env: TTEnv,
+    std_ee: float = 0.5,
+    threshold: float = 0.03,
+    gate_floor: float = 0.30,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_future_touch_point_target(env, std_ee=std_ee, threshold=threshold)
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_future_ee_target_stability_gated(
+    env: TTEnv,
+    std_ee: float = 0.4,
+    threshold: float = 0.01,
+    gate_floor: float = 0.30,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_future_ee_target(env, std_ee=std_ee, threshold=threshold)
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_future_landing_x_progress_stability_gated(
+    env: TTEnv,
+    min_x: float = -1.5,
+    target_x: float = 1.15,
+    target_y: float = 0.0,
+    y_std: float = 1.0,
+    y_weight: float = 0.25,
+    gate_floor: float = 0.15,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_future_landing_x_progress(
+        env, min_x=min_x, target_x=target_x, target_y=target_y, y_std=y_std, y_weight=y_weight
+    )
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_hit_ball_velocity_net_target_stability_gated(
+    env: TTEnv,
+    vx_target: float = 3.0,
+    vz_target: float = 1.5,
+    z_target: float = 1.05,
+    z_std: float = 0.35,
+    min_vx: float = 0.1,
+    max_t_net: float = 1.4,
+    t_std: float = 0.7,
+    vx_weight: float = 0.45,
+    vz_weight: float = 0.25,
+    z_weight: float = 0.20,
+    t_weight: float = 0.10,
+    gate_floor: float = 0.15,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_hit_ball_velocity_net_target(
+        env,
+        vx_target=vx_target,
+        vz_target=vz_target,
+        z_target=z_target,
+        z_std=z_std,
+        min_vx=min_vx,
+        max_t_net=max_t_net,
+        t_std=t_std,
+        vx_weight=vx_weight,
+        vz_weight=vz_weight,
+        z_weight=z_weight,
+        t_weight=t_weight,
+    )
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_hit_net_clearance_progress_stability_gated(
+    env: TTEnv,
+    min_vx: float = 0.1,
+    vx_target: float = 2.5,
+    min_z: float = 0.76,
+    target_z: float = 1.05,
+    z_std: float = 0.45,
+    max_t_net: float = 1.8,
+    t_std: float = 0.8,
+    vx_weight: float = 0.65,
+    time_weight: float = 0.35,
+    gate_floor: float = 0.15,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_hit_net_clearance_progress(
+        env,
+        min_vx=min_vx,
+        vx_target=vx_target,
+        min_z=min_z,
+        target_z=target_z,
+        z_std=z_std,
+        max_t_net=max_t_net,
+        t_std=t_std,
+        vx_weight=vx_weight,
+        time_weight=time_weight,
+    )
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_post_hit_net_progress_stability_gated(
+    env: TTEnv,
+    gate_floor: float = 0.15,
+    reward_kwargs: dict | None = None,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_post_hit_net_progress(env, **({} if reward_kwargs is None else dict(reward_kwargs)))
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_future_pass_net_stability_gated(
+    env: TTEnv,
+    std_h: float = 0.06,
+    z_target: float = 0.76 + 0.24,
+    gate_floor: float = 0.15,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_future_pass_net(env, std_h=std_h, z_target=z_target)
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_table_success_stability_gated(
+    env: TTEnv,
+    gate_floor: float = 0.10,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    return _apply_a3_stability_gate(env, reward_table_success(env), gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_opponent_table_after_paddle_hit_target_stability_gated(
+    env: TTEnv,
+    target_x: float = 1.15,
+    target_y: float = 0.0,
+    x_std: float = 0.7,
+    y_std: float = 0.5,
+    gate_floor: float = 0.10,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_opponent_table_after_paddle_hit_target(
+        env, target_x=target_x, target_y=target_y, x_std=x_std, y_std=y_std
+    )
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
 
 def robot_px_l2(env: BaseEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
