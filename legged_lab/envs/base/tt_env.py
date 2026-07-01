@@ -449,10 +449,12 @@ class TTEnv(VecEnv):
         # ball_pos = self.ball.data.root_pos_w - self.scene.env_origins  
         ball_linvel = self.ball.data.root_lin_vel_w
         robot_pos = robot.data.root_link_pos_w - table.data.root_link_pos_w
-        # Relative target offset (x,y): use ball prediction shifted by (-0.1, +0.6) as desired robot target
+        future_paddle_x_offset = self.cfg.robot.future_paddle_x_offset
+        future_paddle_y_offset = self.cfg.robot.future_paddle_y_offset
+        # Relative target offset (x,y): desired base location from the predicted racket target.
         ball_target_xy = torch.stack([
-            self.ball_prediction[:, 0] - 0.1,
-            self.ball_prediction[:, 1] + 0.6,
+            self.ball_prediction[:, 0] - future_paddle_x_offset,
+            self.ball_prediction[:, 1] - future_paddle_y_offset,
         ], dim=1)
         rel_target_xy = (ball_target_xy - robot_pos[:, :2]) * self.obs_scales.robot_pos
 
@@ -522,10 +524,12 @@ class TTEnv(VecEnv):
         # ball_pos = self.ball.data.root_pos_w - self.scene.env_origins  
         ball_linvel = self.ball.data.root_lin_vel_w
         robot_pos = robot.data.root_link_pos_w - table.data.root_link_pos_w
-        # Relative target offset (x,y) for actor obs with perception
+        future_paddle_x_offset = self.cfg.robot.future_paddle_x_offset
+        future_paddle_y_offset = self.cfg.robot.future_paddle_y_offset
+        # Relative target offset (x,y) for actor obs with perception.
         ball_target_xy = torch.stack([
-            self.ball_prediction[:, 0] - 0.1,
-            self.ball_prediction[:, 1] + 0.6,
+            self.ball_prediction[:, 0] - future_paddle_x_offset,
+            self.ball_prediction[:, 1] - future_paddle_y_offset,
         ], dim=1)
         rel_target_xy = (ball_target_xy - robot_pos[:, :2]) * self.obs_scales.robot_pos
 
@@ -999,6 +1003,7 @@ class TTEnv(VecEnv):
         g=9.81
         body_height=self.cfg.robot.future_body_height
         vel_max=7.0
+        paddle_x_offset = self.cfg.robot.future_paddle_x_offset
         paddle_y_offset = self.cfg.robot.future_paddle_y_offset
 
         self.mask_before = (has_bounced == 0).squeeze(-1)
@@ -1055,8 +1060,12 @@ class TTEnv(VecEnv):
         self.pos_pred_before = torch.stack([xpb, ypb, zpb], dim=-1)
         self.pos_pred_after = torch.stack([xpa, ypa, zpa], dim=-1)
 
-        self.pos_pred_before_ro = torch.stack([xpb - 0.1, ypb - paddle_y_offset, torch.ones_like(xpb) * body_height], dim=-1)
-        self.pos_pred_after_ro = torch.stack([xpa - 0.1, ypa - paddle_y_offset, torch.ones_like(xpb) * body_height], dim=-1)
+        self.pos_pred_before_ro = torch.stack(
+            [xpb - paddle_x_offset, ypb - paddle_y_offset, torch.ones_like(xpb) * body_height], dim=-1
+        )
+        self.pos_pred_after_ro = torch.stack(
+            [xpa - paddle_x_offset, ypa - paddle_y_offset, torch.ones_like(xpb) * body_height], dim=-1
+        )
 
         self.ball_future_pose = torch.where(
             self.mask_before.unsqueeze(-1), self.pos_pred_before, self.pos_pred_after
@@ -1097,8 +1106,9 @@ class TTEnv(VecEnv):
         )
         self.robot_future_pos = torch.where(
             mask_invalid_expanded,      # [N,3] bool
-            self.robot_future_pos.new_tensor([-1.80, 0.3, body_height]).expand_as(self.robot_future_pos),               
-            # [-0.9, 0.2, body_height] for all envs
+            self.robot_future_pos.new_tensor(
+                [self.cfg.robot.future_invalid_robot_xy[0], self.cfg.robot.future_invalid_robot_xy[1], body_height]
+            ).expand_as(self.robot_future_pos),
             self.robot_future_pos
         )
 

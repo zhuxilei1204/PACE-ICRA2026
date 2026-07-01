@@ -50,6 +50,24 @@ from legged_lab.envs.a3_tt.a3_tt_config import (
     A3Stage5eEnvCfg,
     A3Stage5eEvalEnvCfg,
     A3Stage5eAgentCfg,
+    A3Stage5fEnvCfg,
+    A3Stage5fEvalEnvCfg,
+    A3Stage5fAgentCfg,
+    A3Stage5gEnvCfg,
+    A3Stage5gEvalEnvCfg,
+    A3Stage5gAgentCfg,
+    A3Stage5gFixedBallEnvCfg,
+    A3Stage5gFixedBallEvalEnvCfg,
+    A3Stage5gFixedBallAgentCfg,
+    A3Stage5gWideEnvCfg,
+    A3Stage5gWideEvalEnvCfg,
+    A3Stage5gWideAgentCfg,
+    A3Stage5hHitQualityEnvCfg,
+    A3Stage5hHitQualityEvalEnvCfg,
+    A3Stage5hHitQualityAgentCfg,
+    A3Stage5iStableHitQualityEnvCfg,
+    A3Stage5iStableHitQualityEvalEnvCfg,
+    A3Stage5iStableHitQualityAgentCfg,
     A3Stage4eEnvCfg,
     A3Stage4eEvalEnvCfg,
     A3Stage4eAgentCfg,
@@ -88,6 +106,18 @@ task_registry.register("a3_tt_stage5d", TTEnv, A3Stage5dEnvCfg(), A3Stage5dAgent
 task_registry.register("a3_tt_stage5d_eval", TTEnv, A3Stage5dEvalEnvCfg(), A3Stage5dAgentCfg())
 task_registry.register("a3_tt_stage5e", TTEnv, A3Stage5eEnvCfg(), A3Stage5eAgentCfg())
 task_registry.register("a3_tt_stage5e_eval", TTEnv, A3Stage5eEvalEnvCfg(), A3Stage5eAgentCfg())
+task_registry.register("a3_tt_stage5f", TTEnv, A3Stage5fEnvCfg(), A3Stage5fAgentCfg())
+task_registry.register("a3_tt_stage5f_eval", TTEnv, A3Stage5fEvalEnvCfg(), A3Stage5fAgentCfg())
+task_registry.register("a3_tt_stage5g", TTEnv, A3Stage5gEnvCfg(), A3Stage5gAgentCfg())
+task_registry.register("a3_tt_stage5g_eval", TTEnv, A3Stage5gEvalEnvCfg(), A3Stage5gAgentCfg())
+task_registry.register("a3_tt_stage5g_fixedball", TTEnv, A3Stage5gFixedBallEnvCfg(), A3Stage5gFixedBallAgentCfg())
+task_registry.register("a3_tt_stage5g_fixedball_eval", TTEnv, A3Stage5gFixedBallEvalEnvCfg(), A3Stage5gFixedBallAgentCfg())
+task_registry.register("a3_tt_stage5g_wide", TTEnv, A3Stage5gWideEnvCfg(), A3Stage5gWideAgentCfg())
+task_registry.register("a3_tt_stage5g_wide_eval", TTEnv, A3Stage5gWideEvalEnvCfg(), A3Stage5gWideAgentCfg())
+task_registry.register("a3_tt_stage5h_hitquality", TTEnv, A3Stage5hHitQualityEnvCfg(), A3Stage5hHitQualityAgentCfg())
+task_registry.register("a3_tt_stage5h_hitquality_eval", TTEnv, A3Stage5hHitQualityEvalEnvCfg(), A3Stage5hHitQualityAgentCfg())
+task_registry.register("a3_tt_stage5i_stable_hitquality", TTEnv, A3Stage5iStableHitQualityEnvCfg(), A3Stage5iStableHitQualityAgentCfg())
+task_registry.register("a3_tt_stage5i_stable_hitquality_eval", TTEnv, A3Stage5iStableHitQualityEvalEnvCfg(), A3Stage5iStableHitQualityAgentCfg())
 task_registry.register("a3_tt_stage4e", TTEnv, A3Stage4eEnvCfg(), A3Stage4eAgentCfg())
 task_registry.register("a3_tt_stage4e_eval", TTEnv, A3Stage4eEvalEnvCfg(), A3Stage4eAgentCfg())
 task_registry.register("a3_tt_stage4f", TTEnv, A3Stage4fEnvCfg(), A3Stage4fAgentCfg())

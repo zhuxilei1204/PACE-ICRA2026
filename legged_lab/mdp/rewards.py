@@ -1181,6 +1181,167 @@ def reward_future_pass_net(
     return reward
 
 
+def _normalize_w(vec: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return vec / torch.clamp(torch.linalg.norm(vec, dim=-1, keepdim=True), min=eps)
+
+
+def _paddle_axis_w(env: TTEnv, local_axis: tuple[float, float, float]) -> torch.Tensor:
+    paddle_quat = env.robot.data.body_quat_w[:, env.paddle_body_id, :]
+    paddle_quat = paddle_quat / torch.clamp(torch.linalg.norm(paddle_quat, dim=1, keepdim=True), min=1e-6)
+    axis = torch.tensor(local_axis, device=env.device, dtype=paddle_quat.dtype).unsqueeze(0).expand(env.num_envs, -1)
+    return _normalize_w(math_utils.quat_apply(paddle_quat, axis))
+
+
+def _a3_strike_window_score(
+    env: TTEnv,
+    center_t: float = 0.24,
+    std_t: float = 0.18,
+    min_t: float = 0.04,
+    max_t: float = 0.70,
+    dist_std: float | None = None,
+) -> torch.Tensor:
+    t_future = getattr(env, "ball_future_t", torch.zeros(env.num_envs, 1, device=env.device)).squeeze(-1)
+    valid = ~getattr(env, "mask_invalid", torch.zeros(env.num_envs, device=env.device, dtype=torch.bool))
+    valid = valid & ~getattr(env, "has_touch_paddle", torch.zeros(env.num_envs, device=env.device, dtype=torch.bool))
+    in_time = valid & (t_future >= min_t) & (t_future <= max_t)
+    time_score = torch.exp(-torch.abs(t_future - center_t) / (std_t + 1e-12))
+    score = torch.where(in_time, time_score, torch.zeros_like(time_score))
+    if dist_std is not None:
+        paddle_pos = getattr(env, "paddle_pos", env.paddle_touch_point - env.scene.env_origins)
+        dist = torch.linalg.norm(env.ball_future_pose - paddle_pos, dim=1)
+        dist_score = torch.exp(-dist / (dist_std + 1e-12))
+        score = score * dist_score
+    return torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_strike_window_touch_point(
+    env: TTEnv,
+    center_t: float = 0.24,
+    std_t: float = 0.18,
+    min_t: float = 0.04,
+    max_t: float = 0.70,
+    std_ee: float = 0.38,
+    threshold: float = 0.03,
+) -> torch.Tensor:
+    """Reward reaching the predicted hit point only inside the useful strike window."""
+    paddle_pos = getattr(env, "paddle_pos", env.paddle_touch_point - env.scene.env_origins)
+    dist = torch.linalg.norm(env.ball_future_pose - paddle_pos, dim=1)
+    dist_score = torch.exp(-torch.clamp(dist, min=threshold) / (std_ee + 1e-12))
+    return dist_score * _a3_strike_window_score(
+        env, center_t=center_t, std_t=std_t, min_t=min_t, max_t=max_t, dist_std=None
+    )
+
+
+def reward_paddle_normal_alignment(
+    env: TTEnv,
+    local_normal: tuple[float, float, float] = (0.0, 0.0, -1.0),
+    center_t: float = 0.24,
+    std_t: float = 0.18,
+    min_t: float = 0.04,
+    max_t: float = 0.70,
+    dist_std: float = 0.85,
+    align_power: float = 1.5,
+) -> torch.Tensor:
+    """Align the configured paddle face normal with the incoming ball direction."""
+    normal_w = _paddle_axis_w(env, local_normal)
+    incoming_dir = _normalize_w(-env.ball_linvel)
+    alignment = torch.clamp(torch.sum(normal_w * incoming_dir, dim=1), min=0.0, max=1.0)
+    reward = alignment.pow(align_power) * _a3_strike_window_score(
+        env, center_t=center_t, std_t=std_t, min_t=min_t, max_t=max_t, dist_std=dist_std
+    )
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_paddle_swing_velocity_target(
+    env: TTEnv,
+    target_x: float = 1.15,
+    target_y: float = 0.0,
+    target_z: float = 1.05,
+    target_speed: float = 1.20,
+    min_speed: float = 0.05,
+    local_normal: tuple[float, float, float] = (0.0, 0.0, -1.0),
+    normal_floor: float = 0.30,
+    center_t: float = 0.22,
+    std_t: float = 0.16,
+    min_t: float = 0.04,
+    max_t: float = 0.60,
+    dist_std: float = 0.70,
+) -> torch.Tensor:
+    """Reward paddle velocity toward the opponent side during the strike window."""
+    paddle_pos = getattr(env, "paddle_pos", env.paddle_touch_point - env.scene.env_origins)
+    paddle_vel = env.robot.data.body_lin_vel_w[:, env.paddle_body_id, :]
+    target = torch.stack(
+        [
+            torch.full_like(paddle_pos[:, 0], target_x),
+            torch.full_like(paddle_pos[:, 1], target_y),
+            torch.full_like(paddle_pos[:, 2], target_z),
+        ],
+        dim=1,
+    )
+    swing_dir = _normalize_w(target - paddle_pos)
+    forward_speed = torch.sum(paddle_vel * swing_dir, dim=1)
+    speed_score = torch.clamp((forward_speed - min_speed) / (target_speed - min_speed + 1e-12), min=0.0, max=1.0)
+
+    normal_w = _paddle_axis_w(env, local_normal)
+    incoming_dir = _normalize_w(-env.ball_linvel)
+    normal_score = torch.clamp(torch.sum(normal_w * incoming_dir, dim=1), min=0.0, max=1.0)
+    normal_factor = normal_floor + (1.0 - normal_floor) * normal_score
+    reward = speed_score * normal_factor * _a3_strike_window_score(
+        env, center_t=center_t, std_t=std_t, min_t=min_t, max_t=max_t, dist_std=dist_std
+    )
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def penalty_a3_forward_fall_during_strike(
+    env: TTEnv,
+    center_t: float = 0.24,
+    std_t: float = 0.18,
+    min_t: float = 0.02,
+    max_t: float = 0.75,
+    max_root_x: float = -1.48,
+    max_forward_vx: float = 0.35,
+    max_tilt: float = 0.45,
+    min_base_z: float = 0.78,
+    x_std: float = 0.12,
+    vx_std: float = 0.45,
+    tilt_std: float = 0.35,
+    z_std: float = 0.12,
+    x_weight: float = 0.30,
+    vx_weight: float = 0.30,
+    tilt_weight: float = 0.25,
+    z_weight: float = 0.15,
+    max_penalty: float = 1.0,
+) -> torch.Tensor:
+    """Penalize A3 policies that reach the ball by falling toward the table."""
+    asset: Articulation = env.scene["robot"]
+    robot_pos = getattr(env, "robot_pos", asset.data.root_pos_w - env.scene.env_origins)
+
+    strike_active = _a3_strike_window_score(
+        env, center_t=center_t, std_t=std_t, min_t=min_t, max_t=max_t, dist_std=None
+    )
+    post_hit_active = getattr(env, "has_touch_paddle", torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)).float()
+    active = torch.clamp(torch.maximum(strike_active, post_hit_active), min=0.0, max=1.0)
+
+    root_x = robot_pos[:, 0]
+    root_z = robot_pos[:, 2]
+    forward_vx = asset.data.root_lin_vel_w[:, 0]
+    tilt = torch.sqrt(torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1) + 1e-12)
+
+    x_penalty = torch.clamp((root_x - max_root_x) / (x_std + 1e-12), min=0.0, max=max_penalty)
+    vx_penalty = torch.clamp((forward_vx - max_forward_vx) / (vx_std + 1e-12), min=0.0, max=max_penalty)
+    tilt_penalty = torch.clamp((tilt - max_tilt) / (tilt_std + 1e-12), min=0.0, max=max_penalty)
+    z_penalty = torch.clamp((min_base_z - root_z) / (z_std + 1e-12), min=0.0, max=max_penalty)
+
+    total_weight = x_weight + vx_weight + tilt_weight + z_weight + 1e-12
+    penalty = (
+        x_weight * x_penalty
+        + vx_weight * vx_penalty
+        + tilt_weight * tilt_penalty
+        + z_weight * z_penalty
+    ) / total_weight
+    return torch.nan_to_num(active * penalty, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def _resolve_scene_entity_cfg(env: TTEnv, cfg: SceneEntityCfg | None) -> SceneEntityCfg | None:
     if cfg is None:
         return None
@@ -1399,6 +1560,89 @@ def reward_future_ee_target_stability_gated(
     score_kwargs: dict | None = None,
 ) -> torch.Tensor:
     reward = reward_future_ee_target(env, std_ee=std_ee, threshold=threshold)
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_strike_window_touch_point_stability_gated(
+    env: TTEnv,
+    center_t: float = 0.24,
+    std_t: float = 0.18,
+    min_t: float = 0.04,
+    max_t: float = 0.70,
+    std_ee: float = 0.38,
+    threshold: float = 0.03,
+    gate_floor: float = 0.25,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_strike_window_touch_point(
+        env,
+        center_t=center_t,
+        std_t=std_t,
+        min_t=min_t,
+        max_t=max_t,
+        std_ee=std_ee,
+        threshold=threshold,
+    )
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_paddle_normal_alignment_stability_gated(
+    env: TTEnv,
+    local_normal: tuple[float, float, float] = (0.0, 0.0, -1.0),
+    center_t: float = 0.24,
+    std_t: float = 0.18,
+    min_t: float = 0.04,
+    max_t: float = 0.70,
+    dist_std: float = 0.85,
+    align_power: float = 1.5,
+    gate_floor: float = 0.25,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_paddle_normal_alignment(
+        env,
+        local_normal=local_normal,
+        center_t=center_t,
+        std_t=std_t,
+        min_t=min_t,
+        max_t=max_t,
+        dist_std=dist_std,
+        align_power=align_power,
+    )
+    return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
+
+
+def reward_paddle_swing_velocity_target_stability_gated(
+    env: TTEnv,
+    target_x: float = 1.15,
+    target_y: float = 0.0,
+    target_z: float = 1.05,
+    target_speed: float = 1.20,
+    min_speed: float = 0.05,
+    local_normal: tuple[float, float, float] = (0.0, 0.0, -1.0),
+    normal_floor: float = 0.30,
+    center_t: float = 0.22,
+    std_t: float = 0.16,
+    min_t: float = 0.04,
+    max_t: float = 0.60,
+    dist_std: float = 0.70,
+    gate_floor: float = 0.25,
+    score_kwargs: dict | None = None,
+) -> torch.Tensor:
+    reward = reward_paddle_swing_velocity_target(
+        env,
+        target_x=target_x,
+        target_y=target_y,
+        target_z=target_z,
+        target_speed=target_speed,
+        min_speed=min_speed,
+        local_normal=local_normal,
+        normal_floor=normal_floor,
+        center_t=center_t,
+        std_t=std_t,
+        min_t=min_t,
+        max_t=max_t,
+        dist_std=dist_std,
+    )
     return _apply_a3_stability_gate(env, reward, gate_floor, score_kwargs=score_kwargs)
 
 

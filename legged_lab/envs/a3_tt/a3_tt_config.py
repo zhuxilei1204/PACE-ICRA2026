@@ -198,6 +198,127 @@ A3_STAGE5D_BALL_CURRICULUM_PHASES = [
         "ball_pos_y_range": (-0.10, 0.10),
     },
 ]
+A3_STAGE5F_ACTION_SCALE_BY_JOINT = A3_STAGE5B_ACTION_SCALE_BY_JOINT.copy()
+A3_STAGE5F_ACTION_SCALE_BY_JOINT[19:31] = [
+    0.050,  # left_hip_pitch_joint
+    0.050,  # left_hip_roll_joint
+    0.040,  # left_hip_yaw_joint
+    0.055,  # left_knee_joint
+    0.045,  # left_ankle_pitch_joint
+    0.045,  # left_ankle_roll_joint
+    0.050,  # right_hip_pitch_joint
+    0.050,  # right_hip_roll_joint
+    0.040,  # right_hip_yaw_joint
+    0.055,  # right_knee_joint
+    0.045,  # right_ankle_pitch_joint
+    0.045,  # right_ankle_roll_joint
+]
+A3_STAGE5G_FUTURE_PADDLE_X_OFFSET = 0.224
+A3_STAGE5G_FUTURE_PADDLE_Y_OFFSET = -0.397
+A3_STAGE5G_INVALID_ROBOT_XY = (-1.86, 0.35)
+A3_STAGE5G_WIDE_CONTACT_THRESHOLD = 0.04
+A3_STAGE5G_WIDE_BALL_RANGES = {
+    "ball_speed_x_range": (-5.90, -4.95),
+    "ball_speed_y_range": (-0.42, 0.18),
+    "ball_speed_z_range": (1.42, 1.85),
+    "ball_pos_y_range": (-0.09, 0.09),
+}
+A3_STAGE5H_PADDLE_NORMAL_AXIS = (0.0, 0.0, -1.0)
+A3_STAGE5F_BALL_ABILITY_PHASES = [
+    {
+        "ranges": {
+            "ball_speed_x_range": (-5.05, -4.75),
+            "ball_speed_y_range": (-0.08, 0.03),
+            "ball_speed_z_range": (1.42, 1.60),
+            "ball_pos_y_range": (-0.035, 0.035),
+        },
+        "advance": {
+            "min_window_steps": 1200,
+            "min_window_serves": 2048,
+            "min_mean_episode_length": 105.0,
+            "min_hit_rate": 0.32,
+            "max_reset_rate": 0.018,
+        },
+    },
+    {
+        "ranges": {
+            "ball_speed_x_range": (-5.25, -4.80),
+            "ball_speed_y_range": (-0.16, 0.06),
+            "ball_speed_z_range": (1.40, 1.66),
+            "ball_pos_y_range": (-0.05, 0.05),
+        },
+        "advance": {
+            "min_window_steps": 1600,
+            "min_window_serves": 2048,
+            "min_mean_episode_length": 125.0,
+            "min_hit_rate": 0.26,
+            "max_reset_rate": 0.014,
+        },
+        "regress": {
+            "min_window_steps": 1200,
+            "min_window_serves": 1024,
+            "max_mean_episode_length": 85.0,
+            "max_hit_rate": 0.10,
+        },
+    },
+    {
+        "ranges": {
+            "ball_speed_x_range": (-5.50, -4.85),
+            "ball_speed_y_range": (-0.28, 0.12),
+            "ball_speed_z_range": (1.40, 1.75),
+            "ball_pos_y_range": (-0.07, 0.07),
+        },
+        "advance": {
+            "min_window_steps": 2000,
+            "min_window_serves": 2048,
+            "min_mean_episode_length": 145.0,
+            "min_hit_rate": 0.20,
+            "max_reset_rate": 0.012,
+        },
+        "regress": {
+            "min_window_steps": 1600,
+            "min_window_serves": 1024,
+            "max_mean_episode_length": 100.0,
+            "max_hit_rate": 0.08,
+        },
+    },
+    {
+        "ranges": {
+            "ball_speed_x_range": (-5.90, -4.95),
+            "ball_speed_y_range": (-0.42, 0.18),
+            "ball_speed_z_range": (1.42, 1.85),
+            "ball_pos_y_range": (-0.09, 0.09),
+        },
+        "advance": {
+            "min_window_steps": 2400,
+            "min_window_serves": 2048,
+            "min_mean_episode_length": 165.0,
+            "min_hit_rate": 0.16,
+            "min_success_rate": 0.002,
+            "max_reset_rate": 0.010,
+        },
+        "regress": {
+            "min_window_steps": 2000,
+            "min_window_serves": 1024,
+            "max_mean_episode_length": 115.0,
+            "max_hit_rate": 0.05,
+        },
+    },
+    {
+        "ranges": {
+            "ball_speed_x_range": (-6.30, -5.10),
+            "ball_speed_y_range": (-0.55, 0.22),
+            "ball_speed_z_range": (1.45, 1.90),
+            "ball_pos_y_range": (-0.10, 0.10),
+        },
+        "regress": {
+            "min_window_steps": 2400,
+            "min_window_serves": 1024,
+            "max_mean_episode_length": 130.0,
+            "max_hit_rate": 0.04,
+        },
+    },
+]
 
 
 @configclass
@@ -799,6 +920,85 @@ def _a3_stage5e_post_hit_params(gate_floor: float, **reward_kwargs):
     return params
 
 
+def _a3_stage5f_score_kwargs():
+    params = _a3_stage5e_score_kwargs()
+    params.update(
+        {
+            "height_weight": 0.32,
+            "upright_weight": 0.30,
+            "support_weight": 0.23,
+            "velocity_weight": 0.00,
+            "clean_weight": 0.10,
+            "feet_width_weight": 0.05,
+            "min_base_z": 0.76,
+            "height_std": 0.16,
+            "upright_std": 0.30,
+            "target_feet_width": 0.44,
+            "feet_width_std": 0.20,
+        }
+    )
+    return params
+
+
+def _a3_stage5f_stability_params(gate_floor: float | None = None):
+    params = {"score_kwargs": _a3_stage5f_score_kwargs()}
+    if gate_floor is not None:
+        params["gate_floor"] = gate_floor
+    return params
+
+
+def _a3_stage5f_gated_params(gate_floor: float, **reward_params):
+    params = _a3_stage5f_stability_params(gate_floor)
+    params.update(reward_params)
+    return params
+
+
+def _a3_stage5f_post_hit_params(gate_floor: float, **reward_kwargs):
+    params = _a3_stage5f_stability_params(gate_floor)
+    params["reward_kwargs"] = reward_kwargs
+    return params
+
+
+def _a3_stage5i_score_kwargs():
+    params = _a3_stage5f_score_kwargs()
+    params.update(
+        {
+            "height_weight": 0.28,
+            "upright_weight": 0.28,
+            "support_weight": 0.22,
+            "velocity_weight": 0.17,
+            "clean_weight": 0.08,
+            "feet_width_weight": 0.05,
+            "min_base_z": 0.80,
+            "height_std": 0.14,
+            "upright_std": 0.24,
+            "lin_vel_std": 0.65,
+            "ang_vel_std": 1.20,
+            "force_balance_std": 0.50,
+        }
+    )
+    return params
+
+
+def _a3_stage5i_stability_params(gate_floor: float | None = None):
+    params = {"score_kwargs": _a3_stage5i_score_kwargs()}
+    if gate_floor is not None:
+        params["gate_floor"] = gate_floor
+    return params
+
+
+def _a3_stage5i_gated_params(gate_floor: float, **reward_params):
+    params = _a3_stage5i_stability_params(gate_floor)
+    params.update(reward_params)
+    return params
+
+
+def _a3_stage5i_post_hit_params(gate_floor: float, **reward_kwargs):
+    params = _a3_stage5i_stability_params(gate_floor)
+    params["reward_kwargs"] = reward_kwargs
+    return params
+
+
 @configclass
 class A3Stage5ReadyEnvCfg(A3Stage4dEnvCfg):
     def __post_init__(self):
@@ -1379,6 +1579,517 @@ class A3Stage5eEvalEnvCfg(A3Stage5dEvalEnvCfg):
 
 
 @configclass
+class A3Stage5fRewardCfg(A3Stage5dRewardCfg):
+    reward_standing_stability = RewTerm(
+        func=mdp.reward_standing_stability,
+        weight=18.0,
+        params=_a3_stage5f_stability_params(),
+    )
+    penalty_unstable_hit = RewTerm(
+        func=mdp.penalty_unstable_hit,
+        weight=-18.0,
+        params=_a3_stage5f_stability_params(),
+    )
+    reward_future_touch_point = RewTerm(
+        func=mdp.reward_future_touch_point_target,
+        weight=9.0,
+        params={"std_ee": 0.5, "threshold": 0.03},
+    )
+    reward_future_dis_ee = RewTerm(
+        func=mdp.reward_future_ee_target,
+        weight=8.0,
+        params={"std_ee": 0.5, "threshold": 0.15},
+    )
+    reward_contact = RewTerm(func=mdp.reward_contact, weight=80.0)
+    reward_future_landing_x_progress = RewTerm(
+        func=mdp.reward_future_landing_x_progress,
+        weight=120.0,
+        params={"min_x": -3.0, "target_x": 1.15, "target_y": 0.0, "y_std": 0.9, "y_weight": 0.30},
+    )
+    reward_hit_ball_velocity_net = RewTerm(
+        func=mdp.reward_hit_ball_velocity_net_target_stability_gated,
+        weight=90.0,
+        params=_a3_stage5f_gated_params(
+            0.35,
+            vx_target=2.6,
+            vz_target=1.35,
+            z_target=1.08,
+            z_std=0.42,
+            min_vx=0.05,
+            max_t_net=1.6,
+            t_std=0.9,
+            vx_weight=0.55,
+            vz_weight=0.20,
+            z_weight=0.20,
+            t_weight=0.05,
+        ),
+    )
+    reward_hit_net_clearance_progress = RewTerm(
+        func=mdp.reward_hit_net_clearance_progress_stability_gated,
+        weight=60.0,
+        params=_a3_stage5f_gated_params(
+            0.35,
+            min_vx=0.05,
+            vx_target=2.4,
+            min_z=0.78,
+            target_z=1.07,
+            z_std=0.48,
+            max_t_net=1.8,
+            t_std=1.0,
+            vx_weight=0.60,
+            time_weight=0.40,
+        ),
+    )
+    reward_future_pass_net = RewTerm(
+        func=mdp.reward_future_pass_net_stability_gated,
+        weight=75.0,
+        params=_a3_stage5f_gated_params(0.35, std_h=0.45, z_target=0.76 + 0.30),
+    )
+    reward_post_hit_net_progress = RewTerm(
+        func=mdp.reward_post_hit_net_progress_stability_gated,
+        weight=45.0,
+        params=_a3_stage5f_post_hit_params(
+            0.35,
+            min_vx=0.05,
+            vx_target=3.0,
+            vz_target=1.3,
+            x_start=-1.45,
+            max_reward_x=-0.85,
+            net_x=0.0,
+            net_z_target=1.08,
+            min_clear_z=0.78,
+            z_std=0.48,
+            max_t_net=1.6,
+            landing_min_x=-1.5,
+            landing_target_x=1.15,
+            y_target=0.0,
+            y_std=0.85,
+            vy_std=2.2,
+            vx_weight=0.30,
+            vz_weight=0.15,
+            x_weight=0.05,
+            z_weight=0.30,
+            landing_weight=0.10,
+            y_weight=0.10,
+        ),
+    )
+    reward_table_success = RewTerm(
+        func=mdp.reward_table_success_stability_gated,
+        weight=45.0,
+        params=_a3_stage5f_stability_params(0.25),
+    )
+    reward_actual_opponent_table_target = RewTerm(
+        func=mdp.reward_opponent_table_after_paddle_hit_target_stability_gated,
+        weight=35.0,
+        params=_a3_stage5f_gated_params(
+            0.25,
+            target_x=1.15,
+            target_y=0.0,
+            x_std=0.8,
+            y_std=0.6,
+        ),
+    )
+
+
+@configclass
+class A3Stage5fCurriculumCfg(A3Stage5cCurriculumCfg):
+    ball_range_curriculum = CurrTerm(
+        func=mdp.modify_ball_ranges_by_ability,
+        params={"phases": A3_STAGE5F_BALL_ABILITY_PHASES, "min_window_steps": 1200, "min_window_serves": 1024},
+    )
+
+
+@configclass
+class A3Stage5fEnvCfg(A3Stage5dEnvCfg):
+    reward = A3Stage5fRewardCfg()
+    curriculum = A3Stage5fCurriculumCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_a3_ball_ranges(self, A3_STAGE5F_BALL_ABILITY_PHASES[0]["ranges"])
+        self.ball.contact_threshold = A3_STAGE5D_CONTACT_THRESHOLD
+        self.robot.action_scale = A3_STAGE5F_ACTION_SCALE_BY_JOINT.copy()
+
+
+@configclass
+class A3Stage5fEvalEnvCfg(A3Stage5dEvalEnvCfg):
+    reward = A3Stage5fRewardCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_a3_ball_ranges(self, A3_STAGE5F_BALL_ABILITY_PHASES[0]["ranges"])
+        self.ball.contact_threshold = A3_STAGE5D_CONTACT_THRESHOLD
+        self.robot.action_scale = A3_STAGE5F_ACTION_SCALE_BY_JOINT.copy()
+
+
+@configclass
+class A3Stage5gEnvCfg(A3Stage5fEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.robot.future_paddle_x_offset = A3_STAGE5G_FUTURE_PADDLE_X_OFFSET
+        self.robot.future_paddle_y_offset = A3_STAGE5G_FUTURE_PADDLE_Y_OFFSET
+        self.robot.future_invalid_robot_xy = A3_STAGE5G_INVALID_ROBOT_XY
+
+
+@configclass
+class A3Stage5gEvalEnvCfg(A3Stage5fEvalEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.robot.future_paddle_x_offset = A3_STAGE5G_FUTURE_PADDLE_X_OFFSET
+        self.robot.future_paddle_y_offset = A3_STAGE5G_FUTURE_PADDLE_Y_OFFSET
+        self.robot.future_invalid_robot_xy = A3_STAGE5G_INVALID_ROBOT_XY
+
+
+@configclass
+class A3Stage5gFixedBallEnvCfg(A3Stage5gEnvCfg):
+    curriculum = CurriculumCfg()
+
+
+@configclass
+class A3Stage5gFixedBallEvalEnvCfg(A3Stage5gEvalEnvCfg):
+    curriculum = CurriculumCfg()
+
+
+@configclass
+class A3Stage5gWideEnvCfg(A3Stage5gFixedBallEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_a3_ball_ranges(self, A3_STAGE5G_WIDE_BALL_RANGES)
+        self.ball.contact_threshold = A3_STAGE5G_WIDE_CONTACT_THRESHOLD
+
+
+@configclass
+class A3Stage5gWideEvalEnvCfg(A3Stage5gFixedBallEvalEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_a3_ball_ranges(self, A3_STAGE5G_WIDE_BALL_RANGES)
+        self.ball.contact_threshold = A3_STAGE5G_WIDE_CONTACT_THRESHOLD
+
+
+@configclass
+class A3Stage5hHitQualityRewardCfg(A3Stage5fRewardCfg):
+    reward_strike_window_touch_point = RewTerm(
+        func=mdp.reward_strike_window_touch_point_stability_gated,
+        weight=20.0,
+        params=_a3_stage5f_gated_params(
+            0.30,
+            center_t=0.24,
+            std_t=0.18,
+            min_t=0.04,
+            max_t=0.70,
+            std_ee=0.34,
+            threshold=0.03,
+        ),
+    )
+    reward_paddle_normal_alignment = RewTerm(
+        func=mdp.reward_paddle_normal_alignment_stability_gated,
+        weight=16.0,
+        params=_a3_stage5f_gated_params(
+            0.30,
+            local_normal=A3_STAGE5H_PADDLE_NORMAL_AXIS,
+            center_t=0.24,
+            std_t=0.18,
+            min_t=0.04,
+            max_t=0.70,
+            dist_std=0.85,
+            align_power=1.5,
+        ),
+    )
+    reward_paddle_swing_velocity = RewTerm(
+        func=mdp.reward_paddle_swing_velocity_target_stability_gated,
+        weight=22.0,
+        params=_a3_stage5f_gated_params(
+            0.30,
+            target_x=1.15,
+            target_y=0.0,
+            target_z=1.05,
+            target_speed=1.15,
+            min_speed=0.04,
+            local_normal=A3_STAGE5H_PADDLE_NORMAL_AXIS,
+            normal_floor=0.30,
+            center_t=0.22,
+            std_t=0.16,
+            min_t=0.04,
+            max_t=0.60,
+            dist_std=0.70,
+        ),
+    )
+    reward_hit_ball_velocity_net = RewTerm(
+        func=mdp.reward_hit_ball_velocity_net_target_stability_gated,
+        weight=120.0,
+        params=_a3_stage5f_gated_params(
+            0.35,
+            vx_target=3.1,
+            vz_target=1.15,
+            z_target=1.05,
+            z_std=0.34,
+            min_vx=0.08,
+            max_t_net=1.35,
+            t_std=0.75,
+            vx_weight=0.62,
+            vz_weight=0.08,
+            z_weight=0.25,
+            t_weight=0.05,
+        ),
+    )
+    reward_hit_net_clearance_progress = RewTerm(
+        func=mdp.reward_hit_net_clearance_progress_stability_gated,
+        weight=85.0,
+        params=_a3_stage5f_gated_params(
+            0.35,
+            min_vx=0.08,
+            vx_target=2.7,
+            min_z=0.78,
+            target_z=1.04,
+            z_std=0.38,
+            max_t_net=1.55,
+            t_std=0.85,
+            vx_weight=0.68,
+            time_weight=0.32,
+        ),
+    )
+    reward_future_pass_net = RewTerm(
+        func=mdp.reward_future_pass_net_stability_gated,
+        weight=100.0,
+        params=_a3_stage5f_gated_params(0.35, std_h=0.36, z_target=0.76 + 0.28),
+    )
+    reward_post_hit_net_progress = RewTerm(
+        func=mdp.reward_post_hit_net_progress_stability_gated,
+        weight=65.0,
+        params=_a3_stage5f_post_hit_params(
+            0.35,
+            min_vx=0.08,
+            vx_target=3.2,
+            vz_target=1.05,
+            x_start=-1.45,
+            max_reward_x=-0.85,
+            net_x=0.0,
+            net_z_target=1.04,
+            min_clear_z=0.78,
+            z_std=0.38,
+            max_t_net=1.35,
+            landing_min_x=-1.5,
+            landing_target_x=1.15,
+            y_target=0.0,
+            y_std=0.75,
+            vy_std=1.8,
+            vx_weight=0.38,
+            vz_weight=0.05,
+            x_weight=0.05,
+            z_weight=0.30,
+            landing_weight=0.12,
+            y_weight=0.10,
+        ),
+    )
+
+
+@configclass
+class A3Stage5hHitQualityEnvCfg(A3Stage5gWideEnvCfg):
+    reward = A3Stage5hHitQualityRewardCfg()
+
+
+@configclass
+class A3Stage5hHitQualityEvalEnvCfg(A3Stage5gWideEvalEnvCfg):
+    reward = A3Stage5hHitQualityRewardCfg()
+
+
+@configclass
+class A3Stage5iStableHitQualityRewardCfg(A3Stage5hHitQualityRewardCfg):
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-2000.0)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-4.0)
+    reward_standing_stability = RewTerm(
+        func=mdp.reward_standing_stability,
+        weight=55.0,
+        params=_a3_stage5i_stability_params(),
+    )
+    penalty_unstable_hit = RewTerm(
+        func=mdp.penalty_unstable_hit,
+        weight=-70.0,
+        params=_a3_stage5i_stability_params(),
+    )
+    penalty_forward_fall_during_strike = RewTerm(
+        func=mdp.penalty_a3_forward_fall_during_strike,
+        weight=-85.0,
+        params={
+            "center_t": 0.24,
+            "std_t": 0.18,
+            "min_t": 0.02,
+            "max_t": 0.75,
+            "max_root_x": -1.48,
+            "max_forward_vx": 0.35,
+            "max_tilt": 0.45,
+            "min_base_z": 0.78,
+        },
+    )
+    reward_future_touch_point = RewTerm(
+        func=mdp.reward_future_touch_point_target_stability_gated,
+        weight=7.0,
+        params=_a3_stage5i_gated_params(0.12, std_ee=0.5, threshold=0.03),
+    )
+    reward_future_dis_ee = RewTerm(
+        func=mdp.reward_future_ee_target_stability_gated,
+        weight=6.0,
+        params=_a3_stage5i_gated_params(0.12, std_ee=0.5, threshold=0.15),
+    )
+    reward_contact = RewTerm(
+        func=mdp.reward_contact_stability_gated,
+        weight=75.0,
+        params=_a3_stage5i_stability_params(0.05),
+    )
+    reward_future_landing_x_progress = RewTerm(
+        func=mdp.reward_future_landing_x_progress_stability_gated,
+        weight=90.0,
+        params=_a3_stage5i_gated_params(
+            0.08,
+            min_x=-3.0,
+            target_x=1.15,
+            target_y=0.0,
+            y_std=0.9,
+            y_weight=0.30,
+        ),
+    )
+    reward_strike_window_touch_point = RewTerm(
+        func=mdp.reward_strike_window_touch_point_stability_gated,
+        weight=16.0,
+        params=_a3_stage5i_gated_params(
+            0.05,
+            center_t=0.24,
+            std_t=0.18,
+            min_t=0.04,
+            max_t=0.70,
+            std_ee=0.34,
+            threshold=0.03,
+        ),
+    )
+    reward_paddle_normal_alignment = RewTerm(
+        func=mdp.reward_paddle_normal_alignment_stability_gated,
+        weight=14.0,
+        params=_a3_stage5i_gated_params(
+            0.05,
+            local_normal=A3_STAGE5H_PADDLE_NORMAL_AXIS,
+            center_t=0.24,
+            std_t=0.18,
+            min_t=0.04,
+            max_t=0.70,
+            dist_std=0.85,
+            align_power=1.5,
+        ),
+    )
+    reward_paddle_swing_velocity = RewTerm(
+        func=mdp.reward_paddle_swing_velocity_target_stability_gated,
+        weight=14.0,
+        params=_a3_stage5i_gated_params(
+            0.05,
+            target_x=1.15,
+            target_y=0.0,
+            target_z=1.05,
+            target_speed=1.05,
+            min_speed=0.04,
+            local_normal=A3_STAGE5H_PADDLE_NORMAL_AXIS,
+            normal_floor=0.30,
+            center_t=0.22,
+            std_t=0.16,
+            min_t=0.04,
+            max_t=0.60,
+            dist_std=0.70,
+        ),
+    )
+    reward_hit_ball_velocity_net = RewTerm(
+        func=mdp.reward_hit_ball_velocity_net_target_stability_gated,
+        weight=110.0,
+        params=_a3_stage5i_gated_params(
+            0.08,
+            vx_target=3.1,
+            vz_target=1.15,
+            z_target=1.05,
+            z_std=0.34,
+            min_vx=0.08,
+            max_t_net=1.35,
+            t_std=0.75,
+            vx_weight=0.62,
+            vz_weight=0.08,
+            z_weight=0.25,
+            t_weight=0.05,
+        ),
+    )
+    reward_hit_net_clearance_progress = RewTerm(
+        func=mdp.reward_hit_net_clearance_progress_stability_gated,
+        weight=75.0,
+        params=_a3_stage5i_gated_params(
+            0.08,
+            min_vx=0.08,
+            vx_target=2.7,
+            min_z=0.78,
+            target_z=1.04,
+            z_std=0.38,
+            max_t_net=1.55,
+            t_std=0.85,
+            vx_weight=0.68,
+            time_weight=0.32,
+        ),
+    )
+    reward_future_pass_net = RewTerm(
+        func=mdp.reward_future_pass_net_stability_gated,
+        weight=95.0,
+        params=_a3_stage5i_gated_params(0.08, std_h=0.36, z_target=0.76 + 0.28),
+    )
+    reward_post_hit_net_progress = RewTerm(
+        func=mdp.reward_post_hit_net_progress_stability_gated,
+        weight=60.0,
+        params=_a3_stage5i_post_hit_params(
+            0.08,
+            min_vx=0.08,
+            vx_target=3.2,
+            vz_target=1.05,
+            x_start=-1.45,
+            max_reward_x=-0.85,
+            net_x=0.0,
+            net_z_target=1.04,
+            min_clear_z=0.78,
+            z_std=0.38,
+            max_t_net=1.35,
+            landing_min_x=-1.5,
+            landing_target_x=1.15,
+            y_target=0.0,
+            y_std=0.75,
+            vy_std=1.8,
+            vx_weight=0.38,
+            vz_weight=0.05,
+            x_weight=0.05,
+            z_weight=0.30,
+            landing_weight=0.12,
+            y_weight=0.10,
+        ),
+    )
+    reward_table_success = RewTerm(
+        func=mdp.reward_table_success_stability_gated,
+        weight=55.0,
+        params=_a3_stage5i_stability_params(0.05),
+    )
+    reward_actual_opponent_table_target = RewTerm(
+        func=mdp.reward_opponent_table_after_paddle_hit_target_stability_gated,
+        weight=45.0,
+        params=_a3_stage5i_gated_params(
+            0.05,
+            target_x=1.15,
+            target_y=0.0,
+            x_std=0.8,
+            y_std=0.6,
+        ),
+    )
+
+
+@configclass
+class A3Stage5iStableHitQualityEnvCfg(A3Stage5hHitQualityEnvCfg):
+    reward = A3Stage5iStableHitQualityRewardCfg()
+
+
+@configclass
+class A3Stage5iStableHitQualityEvalEnvCfg(A3Stage5hHitQualityEvalEnvCfg):
+    reward = A3Stage5iStableHitQualityRewardCfg()
+
+
+@configclass
 class A3Stage4eRewardCfg(A3Stage4dRewardCfg):
     reward_future_opponent_landing = RewTerm(
         func=mdp.reward_future_opponent_landing_target,
@@ -1798,6 +2509,61 @@ class A3Stage5dAgentCfg(A3Stage5cAgentCfg):
 
 @configclass
 class A3Stage5eAgentCfg(A3Stage5cAgentCfg):
+    pass
+
+
+@configclass
+class A3Stage5fAgentCfg(A3Stage5cAgentCfg):
+    policy = RslRlPpoActorCriticCfg(
+        class_name="ActorCritic",
+        init_noise_std=0.13,
+        noise_std_type="scalar",
+        actor_hidden_dims=[512, 512, 128],
+        critic_hidden_dims=[512, 512, 128],
+        activation="elu",
+    )
+    algorithm = RslRlPpoAlgorithmCfg(
+        class_name="PPO",
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.00010,
+        num_learning_epochs=3,
+        num_mini_batches=4,
+        learning_rate=1.2e-4,
+        schedule="adaptive",
+        gamma=0.95,
+        lam=0.95,
+        desired_kl=0.0025,
+        max_grad_norm=1.0,
+        normalize_advantage_per_mini_batch=False,
+        symmetry_cfg=None,
+        rnd_cfg=None,
+    )
+
+
+@configclass
+class A3Stage5gAgentCfg(A3Stage5fAgentCfg):
+    pass
+
+
+@configclass
+class A3Stage5gFixedBallAgentCfg(A3Stage5gAgentCfg):
+    pass
+
+
+@configclass
+class A3Stage5gWideAgentCfg(A3Stage5gAgentCfg):
+    pass
+
+
+@configclass
+class A3Stage5hHitQualityAgentCfg(A3Stage5gWideAgentCfg):
+    pass
+
+
+@configclass
+class A3Stage5iStableHitQualityAgentCfg(A3Stage5hHitQualityAgentCfg):
     pass
 
 

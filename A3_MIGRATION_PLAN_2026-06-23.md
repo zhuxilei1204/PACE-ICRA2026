@@ -24,6 +24,46 @@ CUDA_VISIBLE_DEVICES=1 python -m legged_lab.scripts.eval \
 4. 不回滚当前工作树已有变化。开始分析前，仓库已有大量 `100644 => 100755` 文件模式变化，`git diff --stat` 显示 0 行内容差异。
 5. 每次代码修改同步更新 `CODE_CHANGE_LOG_2026-06-23_A3.md`。
 
+## 2026-07-01 A3 stage5g_wide 计划
+
+目的：在已验证 A3 几何 offset 可以让窄球路接近击球中心后，取消窄球路对 hit rate 的放大效应，改用 A3 当前站位和右臂可达范围内的宽球路做长训。
+
+修改边界：
+
+- 新增 `a3_tt_stage5g_wide` / `a3_tt_stage5g_wide_eval`，不覆盖现有 T1、stage5g、stage5g_fixedball；
+- 继续复用 stage5g 的 A3 FK 几何 offset；
+- 关闭 ball curriculum，固定为 A3 适配宽球路；
+- 球路宽度和球速不直接照搬 T1，而从 stage5f 后段 A3 可达范围选取；
+- 将 contact threshold 收紧，用于降低“擦到就算 hit”的乐观统计。
+
+验证顺序：
+
+1. `py_compile` 检查配置和注册。
+2. `num_envs=64` 做 1 iter smoke。
+3. 尝试 `num_envs=4096` 做 1 iter smoke；若 Isaac/A3 资产初始化失败，长训改用 2048 或 1024。
+
+## 2026-07-01 A3 stage5h_hitquality 对照计划
+
+目的：在 GPU0 的 `stage5g_wide` 保持不动的前提下，新增 GPU1 对照实验，验证拍面法向、击球速度和击球窗口 shaping 是否能改善“接触少、成功率打不开”的问题。
+
+对照关系：
+
+- GPU0：`a3_tt_stage5g_wide`，A3 FK 几何修正 + A3 适配宽球路 + 严格 contact；
+- GPU1：新增 `a3_tt_stage5h_hitquality`，完全继承同一几何、同一宽球路、同一 contact threshold，只增加击球质量相关 reward。
+
+新增优化：
+
+- 拍面法向：根据诊断脚本确认 A3 球拍正面为本地 `-Z`，奖励该法向在击球窗口内朝向来球方向 `-ball_linvel`；
+- 击球速度：保留并加强 post-hit ball velocity/net-clearance reward，同时增加击球窗口内球拍朝对面桌方向的挥拍速度 shaping；
+- 击球窗口：使用 `ball_future_t` 和 `ball_future_pose` 构造时间窗口与未来击球点接近奖励，降低“任意时间碰球”对学习的误导。
+
+边界：
+
+- 不停止 GPU0 的 `stage5g_wide`；
+- 不修改 T1；
+- 新增 task，不覆盖已有 A3 任务；
+- 长训使用 GPU1，`num_envs=4096` 先 smoke 再启动。
+
 ## 当前代码理解
 
 ## 补充分析文档
@@ -4749,6 +4789,124 @@ A3 的优化目标分层：
   - net clear；
   - opponent table landing；
 - T1 曲线用于判断训练节奏，但 A3 目标要高于 T1。
+
+## 2026-06-30 A3 stage5f：能力触发 curriculum 与解除早期门控计划
+
+stage5d/stage5e 结果复盘：
+
+- `stage5d` 最终 `TT_hit_rate` 从早期约 `0.67` 掉到约 `0.003`，`TT_success_rate=0`；
+- `stage5e` 最终 `TT_hit_rate` 约 `0.038`，优于 stage5d，但 `TT_success_rate` 仍为 0；
+- 两者最终 `mean_episode_length` 都约 `75`，说明没有学会长时间稳定站立；
+- stage5e 的 `reward_standing_stability` 很早饱和，但 WebRTC 可视化仍显示站不稳，说明该 reward 对“真稳定”和“僵住/假稳定”的区分不足；
+- stage5d/stage5e 的 ball curriculum 都按 step 推进，策略能力不足时仍会自动加难，导致 hit rate 断崖式下降。
+
+本阶段新增 A3-only stage：
+
+```text
+a3_tt_stage5f
+a3_tt_stage5f_eval
+```
+
+核心改动：
+
+1. 解除早期任务奖励的稳定门控
+   - `reward_future_touch_point`
+   - `reward_future_dis_ee`
+   - `reward_contact`
+   - `reward_future_landing_x_progress`
+
+   这些项用于探索“靠近球路/触球/初步击球”，不再用 stability gate 压弱。
+
+2. 只 gate 高阶任务奖励
+   - `reward_hit_ball_velocity_net`
+   - `reward_hit_net_clearance_progress`
+   - `reward_future_pass_net`
+   - `reward_post_hit_net_progress`
+   - `reward_table_success`
+   - `reward_actual_opponent_table_target`
+
+   高阶项使用较高 `gate_floor=0.35/0.25`，避免早期完全失去梯度，但不稳定状态下不能拿满高质量回球奖励。
+
+3. 改写站稳奖励参数
+   - 降低或移除 `low_velocity_score` 对 dense standing 的影响；
+   - 避免鼓励“低速度僵住”；
+   - 更强调 base 高度、身体竖直、双脚支撑、干净接触、脚距；
+   - `penalty_unstable_hit` 从强惩罚改为弱约束，防止“刚碰到球就被过度惩罚”。
+
+stage5f 初始稳定权重：
+
+```text
+height_weight = 0.32
+upright_weight = 0.30
+support_weight = 0.23
+velocity_weight = 0.00
+clean_weight = 0.10
+feet_width_weight = 0.05
+```
+
+4. 能力触发 ball curriculum
+
+不再仅按 `global_step` 推进球路。新增 curriculum 会维护一个窗口内的在线指标：
+
+```text
+serve_count
+hit_rate
+success_rate
+mean_episode_length
+reset_rate
+stage
+```
+
+升阶段条件示例：
+
+```text
+window_serves >= min_window_serves
+mean_episode_length >= threshold
+hit_rate >= threshold
+reset_rate <= threshold
+```
+
+如果升阶段后 hit/stability 明显掉下去，则回退一档。
+
+5. 小幅放大 A3 下肢 action scale
+
+当前下肢 action scale 偏保守，容易叠加稳定/能耗/动作平滑惩罚后变成“少动僵住”。stage5f 只在新 stage 中小幅放大下肢 action scale，让策略能调整重心和身体位置。
+
+边界：
+
+- 不修改 T1；
+- 不修改 stage5d/stage5e 作为失败对照；
+- 不直接改变全局 reset 逻辑；
+- 训练后必须优先通过 WebRTC 检查是否仍僵住/摔倒，而不是只看 hit rate。
+
+实现确认（2026-06-30 17:41）：
+
+- 已新增 `modify_ball_ranges_by_ability()`；
+- 已新增 `a3_tt_stage5f` / `a3_tt_stage5f_eval`；
+- 已将 stage5f 的早期探索项改回 ungated reward；
+- 已将高阶过网/落台项保留 soft gate；
+- 已将 stage5f dense standing reward 的 `velocity_weight` 调为 `0.00`；
+- 已小幅放大 stage5f 下肢 action scale；
+- 语法检查和最小 smoke test 通过。
+
+验证命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/zxl/miniconda3/envs/zxl-pace/bin/python -m legged_lab.scripts.train \
+  --task=a3_tt_stage5f \
+  --logger=tensorboard \
+  --num_envs=64 \
+  --max_iterations=1 \
+  --run_name=a3_stage5f_abilitycurr_smoke_64_1 \
+  --headless \
+  --predictor
+```
+
+生成目录：
+
+```text
+logs/a3_table_tennis/2026-06-30_17-41-57_a3_stage5f_abilitycurr_smoke_64_1
+```
 
 ## 2026-06-29 A3 stage5c 长训前优化计划
 

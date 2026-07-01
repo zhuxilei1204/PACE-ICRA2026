@@ -69,7 +69,9 @@ class RobotCfg:
     paddle_body_index: int = 15
     paddle_local_offset: tuple = (0.0, -0.345, 0.0)
     future_body_height: float = 0.69
+    future_paddle_x_offset: float = 0.10
     future_paddle_y_offset: float = -0.60
+    future_invalid_robot_xy: tuple = (-1.80, 0.30)
 
 @configclass
 class BallCfg:
