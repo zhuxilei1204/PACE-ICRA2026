@@ -155,6 +155,7 @@ class TTEnvCfg:
         add_noise=True,
         # add_noise=False,
         noise_scales=NoiseScalesCfg(
+            lin_vel=0.2,
             ang_vel=0.2,
             projected_gravity=0.05,
             joint_pos=0.01,
@@ -304,6 +305,7 @@ class TTAgentCfg(RslRlOnPolicyRunnerCfg):
     resume = False
     load_run = ".*"
     load_checkpoint = "model_.*.pt"
+    init_at_random_ep_len = True
 
     def __post_init__(self):
         pass

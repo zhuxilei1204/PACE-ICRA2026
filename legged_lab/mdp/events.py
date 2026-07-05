@@ -113,3 +113,43 @@ def reset_joints_by_offset_debug(
     # set into the physics simulation
     asset.write_joint_state_to_sim(joint_pos, joint_vel, joint_ids=asset_cfg.joint_ids, env_ids=env_ids)
 
+
+def reset_joints_by_position_map(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    joint_pos: dict[str, float],
+    position_range: tuple[float, float] | None = None,
+    velocity_range: tuple[float, float] = (0.0, 0.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset matched joints to explicit positions instead of the actuator default target."""
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    joint_ids: list[int] = []
+    values: list[float] = []
+    seen: set[int] = set()
+    for joint_name_expr, value in joint_pos.items():
+        matched_ids, _ = asset.find_joints(joint_name_expr, preserve_order=True)
+        if not matched_ids:
+            raise ValueError(f"No robot joints matched reset position {joint_name_expr!r}.")
+        for joint_id in matched_ids:
+            if joint_id in seen:
+                continue
+            seen.add(joint_id)
+            joint_ids.append(joint_id)
+            values.append(float(value))
+
+    if not joint_ids:
+        return
+
+    iter_env_ids = env_ids[:, None]
+    joint_pos_tensor = torch.tensor(values, dtype=asset.data.default_joint_pos.dtype, device=env.device)
+    joint_pos_tensor = joint_pos_tensor.unsqueeze(0).expand(len(env_ids), -1).clone()
+    joint_vel = math_utils.sample_uniform(*velocity_range, joint_pos_tensor.shape, joint_pos_tensor.device)
+
+    joint_pos_limits = asset.data.soft_joint_pos_limits[iter_env_ids, joint_ids]
+    joint_pos_tensor = joint_pos_tensor.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
+    joint_vel_limits = asset.data.soft_joint_vel_limits[iter_env_ids, joint_ids]
+    joint_vel = joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
+
+    asset.write_joint_state_to_sim(joint_pos_tensor, joint_vel, joint_ids=joint_ids, env_ids=env_ids)

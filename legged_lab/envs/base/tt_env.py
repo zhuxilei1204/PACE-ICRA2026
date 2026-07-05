@@ -282,6 +282,7 @@ class TTEnv(VecEnv):
         self.obs_joint_ids, self.obs_joint_names = self.robot.find_joints(
             self.cfg.observations.joint_names, preserve_order=self.cfg.observations.preserve_order
         )
+        self._apply_default_joint_pos_override()
 
         self.robot_cfg = SceneEntityCfg(name="robot")
         self.robot_cfg.resolve(self.scene)
@@ -328,6 +329,9 @@ class TTEnv(VecEnv):
         self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.ball_episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.ball_reset_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.stage1_prev_root_z = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.stage1_prev_flat_l2 = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.stage1_bad_posture_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         # will store env ids that had their ball reset in the most recent step
         self.ball_reset_ids = torch.empty(0, dtype=torch.long, device=self.device)
         self.reset_ball_state_buf = torch.zeros(self.num_envs, 13, device=self.device, dtype=torch.float)
@@ -362,6 +366,8 @@ class TTEnv(VecEnv):
         self.ball_prediction = torch.zeros(self.num_envs, 3, device=self.device)
         self.robot_future_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.robot_future_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self.fixed_target_xy = torch.zeros(self.num_envs, 2, device=self.device)
+        self._reset_fixed_target_xy(torch.arange(self.num_envs, device=self.device))
         self.ball_future_t = torch.zeros(self.num_envs, 1, device=self.device)
         self.mask_invalid = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.mask_terminal = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
@@ -439,6 +445,7 @@ class TTEnv(VecEnv):
         net_contact_forces = self.contact_sensor.data.net_forces_w_history
 
         ang_vel = robot.data.root_ang_vel_b
+        root_lin_vel = robot.data.root_lin_vel_b
         projected_gravity = robot.data.projected_gravity_b
         heading = robot.data.heading_w
         # command = self.command_generator.command
@@ -452,11 +459,20 @@ class TTEnv(VecEnv):
         future_paddle_x_offset = self.cfg.robot.future_paddle_x_offset
         future_paddle_y_offset = self.cfg.robot.future_paddle_y_offset
         # Relative target offset (x,y): desired base location from the predicted racket target.
-        ball_target_xy = torch.stack([
-            self.ball_prediction[:, 0] - future_paddle_x_offset,
-            self.ball_prediction[:, 1] - future_paddle_y_offset,
-        ], dim=1)
+        if self.cfg.robot.use_fixed_target_xy_obs:
+            ball_target_xy = self._get_fixed_target_xy(robot_pos)
+        else:
+            ball_target_xy = torch.stack([
+                self.ball_prediction[:, 0] - future_paddle_x_offset,
+                self.ball_prediction[:, 1] - future_paddle_y_offset,
+            ], dim=1)
         rel_target_xy = (ball_target_xy - robot_pos[:, :2]) * self.obs_scales.robot_pos
+        stage1_recovery_obs = self._stage1_recovery_observation(robot_pos, projected_gravity)
+        actor_root_lin_vel_obs = (
+            root_lin_vel * self.obs_scales.lin_vel
+            if getattr(self.cfg.robot, "actor_root_lin_vel_obs", False)
+            else robot_pos.new_zeros((self.num_envs, 0))
+        )
 
         current_actor_obs = torch.cat(
             [
@@ -471,6 +487,8 @@ class TTEnv(VecEnv):
                 self.ball_prediction * self.obs_scales.ball_pos, # use learned prediction in actor obs
                 rel_target_xy,  # 2D relative target base pos
                 heading.unsqueeze(-1) * self.obs_scales.projected_gravity,
+                actor_root_lin_vel_obs,
+                stage1_recovery_obs,
             ],
             dim=-1,
         )
@@ -495,10 +513,10 @@ class TTEnv(VecEnv):
                 (self.ball_reset_counter/self.max_ball_serve_per_episode).unsqueeze(-1),
                 self.has_touch_own_table_prev.unsqueeze(-1) * self.obs_scales.ball_state,
                 self.has_touch_paddle.unsqueeze(-1) * self.obs_scales.ball_state,
+                stage1_recovery_obs,
             ],
             dim=-1,
         )
-        root_lin_vel = robot.data.root_lin_vel_b
         feet_contact = torch.max(torch.norm(net_contact_forces[:, :, self.feet_cfg.body_ids], dim=-1), dim=1)[0] > 0.5
         current_critic_obs = torch.cat(
             [alt_critic_obs, root_lin_vel * self.obs_scales.lin_vel, feet_contact],
@@ -514,6 +532,7 @@ class TTEnv(VecEnv):
         net_contact_forces = self.contact_sensor.data.net_forces_w_history
 
         ang_vel = robot.data.root_ang_vel_b
+        root_lin_vel = robot.data.root_lin_vel_b
         projected_gravity = robot.data.projected_gravity_b
         heading = robot.data.heading_w
         # command = self.command_generator.command
@@ -527,11 +546,20 @@ class TTEnv(VecEnv):
         future_paddle_x_offset = self.cfg.robot.future_paddle_x_offset
         future_paddle_y_offset = self.cfg.robot.future_paddle_y_offset
         # Relative target offset (x,y) for actor obs with perception.
-        ball_target_xy = torch.stack([
-            self.ball_prediction[:, 0] - future_paddle_x_offset,
-            self.ball_prediction[:, 1] - future_paddle_y_offset,
-        ], dim=1)
+        if self.cfg.robot.use_fixed_target_xy_obs:
+            ball_target_xy = self._get_fixed_target_xy(robot_pos)
+        else:
+            ball_target_xy = torch.stack([
+                self.ball_prediction[:, 0] - future_paddle_x_offset,
+                self.ball_prediction[:, 1] - future_paddle_y_offset,
+            ], dim=1)
         rel_target_xy = (ball_target_xy - robot_pos[:, :2]) * self.obs_scales.robot_pos
+        stage1_recovery_obs = self._stage1_recovery_observation(robot_pos, projected_gravity)
+        actor_root_lin_vel_obs = (
+            root_lin_vel * self.obs_scales.lin_vel
+            if getattr(self.cfg.robot, "actor_root_lin_vel_obs", False)
+            else robot_pos.new_zeros((self.num_envs, 0))
+        )
 
         current_actor_obs = torch.cat(
             [
@@ -545,6 +573,8 @@ class TTEnv(VecEnv):
                 self.ball_prediction * self.obs_scales.ball_pos, # use learned prediction in actor obs
                 rel_target_xy,  # 2D relative target base pos
                 heading.unsqueeze(-1) * self.obs_scales.projected_gravity,
+                actor_root_lin_vel_obs,
+                stage1_recovery_obs,
             ],
             dim=-1,
         )
@@ -568,10 +598,10 @@ class TTEnv(VecEnv):
                 (self.episode_length_buf.float() / float(self.max_episode_length)).clamp(0.0, 1.0).unsqueeze(-1),
                 self.has_touch_own_table_prev.unsqueeze(-1) * self.obs_scales.ball_state,
                 self.has_touch_paddle.unsqueeze(-1) * self.obs_scales.ball_state,
+                stage1_recovery_obs,
             ],
             dim=-1,
         )
-        root_lin_vel = robot.data.root_lin_vel_b
         feet_contact = torch.max(torch.norm(net_contact_forces[:, :, self.feet_cfg.body_ids], dim=-1), dim=1)[0] > 0.5
         current_critic_obs = torch.cat(
             [alt_critic_obs, root_lin_vel * self.obs_scales.lin_vel, feet_contact],
@@ -645,6 +675,27 @@ class TTEnv(VecEnv):
 
         return actor_obs, critic_obs
 
+    def _get_fixed_target_xy(self, like_tensor: torch.Tensor) -> torch.Tensor:
+        if hasattr(self, "fixed_target_xy"):
+            return self.fixed_target_xy.to(device=like_tensor.device, dtype=like_tensor.dtype)
+        return like_tensor.new_tensor(self.cfg.robot.future_invalid_robot_xy).expand(self.num_envs, 2)
+
+    def _reset_fixed_target_xy(self, env_ids: torch.Tensor) -> None:
+        if len(env_ids) == 0 or not hasattr(self, "fixed_target_xy"):
+            return
+        base_target = self.fixed_target_xy.new_tensor(self.cfg.robot.future_invalid_robot_xy)
+        x_range = self.cfg.robot.fixed_target_xy_x_range
+        y_range = self.cfg.robot.fixed_target_xy_y_range
+
+        target_xy = base_target.unsqueeze(0).repeat(len(env_ids), 1)
+        if x_range is not None:
+            low, high = float(x_range[0]), float(x_range[1])
+            target_xy[:, 0] = low + (high - low) * torch.rand(len(env_ids), device=self.device)
+        if y_range is not None:
+            low, high = float(y_range[0]), float(y_range[1])
+            target_xy[:, 1] = low + (high - low) * torch.rand(len(env_ids), device=self.device)
+        self.fixed_target_xy[env_ids] = target_xy
+
     def reset(self, env_ids):
         if len(env_ids) == 0:
             return
@@ -666,21 +717,91 @@ class TTEnv(VecEnv):
 
         reward_extras = self.reward_manager.reset(env_ids)
         self.extras["log"].update(reward_extras)
+        self._log_reset_causes(env_ids)
         self.extras["time_outs"] = self.time_out_buf
 
         self.command_generator.reset(env_ids)
+        self._reset_fixed_target_xy(env_ids)
         self.actor_obs_buffer.reset(env_ids)
         self.critic_obs_buffer.reset(env_ids)
         self.action_buffer.reset(env_ids)
         self.perception_buffer.reset(env_ids)
         self.episode_length_buf[env_ids] = 0
         self.ball_reset_counter[env_ids] = 0
+        if hasattr(self, "stage1_bad_posture_steps"):
+            self.stage1_bad_posture_steps[env_ids] = 0
 
         # Reset ball state
         self.reset_ball(env_ids)
 
         self.scene.write_data_to_sim()
         self.sim.forward()
+        self._sync_stage1_recovery_buffers(env_ids)
+
+    def _log_reset_causes(self, env_ids: torch.Tensor) -> None:
+        if len(env_ids) == 0:
+            return
+        reset_cause_attrs = {
+            "Episode_Reset/low_base_z": "reset_low_z_buf",
+            "Episode_Reset/x_low": "reset_x_low_buf",
+            "Episode_Reset/x_high": "reset_x_high_buf",
+            "Episode_Reset/y_low": "reset_y_low_buf",
+            "Episode_Reset/y_high": "reset_y_high_buf",
+            "Episode_Reset/flat_orientation": "reset_flat_orientation_buf",
+            "Episode_Reset/bad_posture_duration": "reset_bad_posture_duration_buf",
+            "Episode_Reset/episode_timeout": "reset_episode_timeout_buf",
+            "Episode_Reset/ball_serve_timeout": "reset_ball_serve_timeout_buf",
+        }
+        for log_name, attr_name in reset_cause_attrs.items():
+            if hasattr(self, attr_name):
+                self.extras["log"][log_name] = getattr(self, attr_name)[env_ids].float().mean()
+        if hasattr(self, "robot_pos"):
+            reset_root_z = self.robot_pos[env_ids, 2]
+            self.extras["log"]["Episode_Reset/root_z_mean"] = reset_root_z.float().mean()
+            self.extras["log"]["Episode_Reset/root_z_min"] = reset_root_z.float().min()
+        if hasattr(self, "flat_orientation_l2_buf"):
+            reset_flat_l2 = self.flat_orientation_l2_buf[env_ids]
+            self.extras["log"]["Episode_Reset/flat_l2_mean"] = reset_flat_l2.float().mean()
+            self.extras["log"]["Episode_Reset/flat_l2_max"] = reset_flat_l2.float().max()
+        if hasattr(self, "episode_length_buf"):
+            self.extras["log"]["Episode_Reset/episode_length_mean"] = self.episode_length_buf[env_ids].float().mean()
+
+    def _current_stage1_recovery_state(self) -> tuple[torch.Tensor, torch.Tensor]:
+        root_z = self.robot.data.root_link_pos_w[:, 2] - self.table.data.root_link_pos_w[:, 2]
+        flat_l2 = torch.sum(torch.square(self.robot.data.projected_gravity_b[:, :2]), dim=1)
+        return root_z, flat_l2
+
+    def _sync_stage1_recovery_buffers(self, env_ids: torch.Tensor | None = None) -> None:
+        if not hasattr(self, "stage1_prev_root_z") or not hasattr(self, "stage1_prev_flat_l2"):
+            return
+        with torch.no_grad():
+            root_z, flat_l2 = self._current_stage1_recovery_state()
+            if env_ids is None:
+                self.stage1_prev_root_z[:] = root_z
+                self.stage1_prev_flat_l2[:] = flat_l2
+            elif len(env_ids) > 0:
+                self.stage1_prev_root_z[env_ids] = root_z[env_ids]
+                self.stage1_prev_flat_l2[env_ids] = flat_l2[env_ids]
+
+    def _stage1_recovery_observation(
+        self, robot_pos: torch.Tensor, projected_gravity: torch.Tensor
+    ) -> torch.Tensor:
+        if not getattr(self.cfg.robot, "stage1_recovery_obs", False):
+            return robot_pos.new_zeros((self.num_envs, 0))
+
+        target_z = float(getattr(self.cfg.robot, "stage1_recovery_target_z", 0.965))
+        flat_deadband = float(getattr(self.cfg.robot, "stage1_recovery_flat_deadband", 0.018))
+        root_z = robot_pos[:, 2]
+        flat_l2 = torch.sum(torch.square(projected_gravity[:, :2]), dim=1)
+        prev_root_z = getattr(self, "stage1_prev_root_z", root_z).to(device=root_z.device, dtype=root_z.dtype)
+        prev_flat_l2 = getattr(self, "stage1_prev_flat_l2", flat_l2).to(device=flat_l2.device, dtype=flat_l2.dtype)
+        dt = max(float(self.step_dt), 1e-6)
+
+        height_error = torch.clamp(root_z - target_z, min=-0.25, max=0.25) * 8.0
+        height_rate = torch.clamp((root_z - prev_root_z) / dt, min=-0.40, max=0.40) * 2.5
+        flat_error = torch.clamp(flat_l2 - flat_deadband, min=-0.04, max=0.24) * 8.0
+        flat_rate = torch.clamp((flat_l2 - prev_flat_l2) / dt, min=-1.50, max=1.50) * 0.7
+        return torch.stack([height_error, height_rate, flat_error, flat_rate], dim=1)
 
     def reset_ball(self, env_ids):
         """Reset only the ball state for specified environments."""
@@ -764,9 +885,23 @@ class TTEnv(VecEnv):
             if len(action_scale) != self.num_actions:
                 raise ValueError(
                     f"Expected action_scale length {self.num_actions}, got {len(action_scale)}."
-                )
+            )
             return torch.tensor(action_scale, dtype=torch.float, device=self.device).unsqueeze(0)
         return float(action_scale)
+
+    def _apply_default_joint_pos_override(self):
+        joint_pos_override = getattr(self.cfg.robot, "default_joint_pos_override", None)
+        if not joint_pos_override:
+            return
+
+        default_joint_pos = self.robot.data.default_joint_pos.clone()
+        for joint_name_expr, value in joint_pos_override.items():
+            joint_ids, joint_names = self.robot.find_joints(joint_name_expr, preserve_order=True)
+            if not joint_ids:
+                raise ValueError(f"No robot joints matched default override {joint_name_expr!r}.")
+            default_joint_pos[:, joint_ids] = float(value)
+        self.robot.data.default_joint_pos[:] = default_joint_pos
+        self.robot.data.default_joint_vel[:] = 0.0
 
     def step(self, actions: torch.Tensor):
 
@@ -823,6 +958,7 @@ class TTEnv(VecEnv):
 
         actor_obs, critic_obs = self.compute_observations()
         self.extras["observations"] = {"critic": critic_obs}
+        self._sync_stage1_recovery_buffers()
 
         return actor_obs, reward_buf, self.reset_buf, self.extras
 
@@ -848,15 +984,50 @@ class TTEnv(VecEnv):
         #     (self.robot_pos[..., 1] < -2.0) |
         #     (self.robot_pos[..., 1] > 2.0)
         # )
+        x_min, x_max = self.cfg.robot.termination_robot_x_range
+        y_min, y_max = self.cfg.robot.termination_robot_y_range
+        self.reset_low_z_buf = self.robot_pos[..., 2] < self.cfg.robot.termination_min_base_z
+        max_flat_orientation = self.cfg.robot.termination_max_flat_orientation_l2
+        if max_flat_orientation is None or max_flat_orientation <= 0.0:
+            self.flat_orientation_l2_buf = torch.zeros_like(self.reset_low_z_buf, dtype=torch.float)
+            self.reset_flat_orientation_buf = torch.zeros_like(self.reset_low_z_buf)
+        else:
+            flat_orientation = torch.sum(torch.square(self.robot.data.projected_gravity_b[:, :2]), dim=1)
+            self.flat_orientation_l2_buf = flat_orientation
+            self.reset_flat_orientation_buf = flat_orientation > max_flat_orientation
+        bad_posture_steps = int(getattr(self.cfg.robot, "stage1_bad_posture_max_steps", 0))
+        if bad_posture_steps > 0:
+            bad_posture = torch.zeros_like(self.reset_low_z_buf)
+            bad_min_z = float(getattr(self.cfg.robot, "stage1_bad_posture_min_base_z", 0.0))
+            bad_max_flat = float(getattr(self.cfg.robot, "stage1_bad_posture_max_flat_orientation_l2", 0.0))
+            if bad_min_z > 0.0:
+                bad_posture |= self.robot_pos[..., 2] < bad_min_z
+            if bad_max_flat > 0.0:
+                bad_posture |= self.flat_orientation_l2_buf > bad_max_flat
+            self.stage1_bad_posture_steps = torch.where(
+                bad_posture,
+                self.stage1_bad_posture_steps + 1,
+                torch.zeros_like(self.stage1_bad_posture_steps),
+            )
+            self.reset_bad_posture_duration_buf = self.stage1_bad_posture_steps >= bad_posture_steps
+        else:
+            self.reset_bad_posture_duration_buf = torch.zeros_like(self.reset_low_z_buf)
+        self.reset_x_low_buf = self.robot_pos[..., 0] < x_min
+        self.reset_x_high_buf = self.robot_pos[..., 0] > x_max
+        self.reset_y_low_buf = self.robot_pos[..., 1] < y_min
+        self.reset_y_high_buf = self.robot_pos[..., 1] > y_max
         reset_buf = (
-            (self.robot_pos[..., 2] < 0.50) |
-            (self.robot_pos[..., 0] < -3.6) |
-            (self.robot_pos[..., 0] > -1.35) |
-            (self.robot_pos[..., 1] < -1.1) |
-            (self.robot_pos[..., 1] > 1.1)
-        )       
-        time_out_buf = self.episode_length_buf >= self.max_episode_length
-        time_out_buf |= self.ball_reset_counter >self.max_ball_serve_per_episode
+            self.reset_low_z_buf |
+            self.reset_x_low_buf |
+            self.reset_x_high_buf |
+            self.reset_y_low_buf |
+            self.reset_y_high_buf |
+            self.reset_flat_orientation_buf |
+            self.reset_bad_posture_duration_buf
+        )
+        self.reset_episode_timeout_buf = self.episode_length_buf >= self.max_episode_length
+        self.reset_ball_serve_timeout_buf = self.ball_reset_counter > self.max_ball_serve_per_episode
+        time_out_buf = self.reset_episode_timeout_buf | self.reset_ball_serve_timeout_buf
         # print(self.episode_length_buf,self.max_episode_length)
         # print(self.max_episode_length_s,self.step_dt)
         # print ('time_out_buf',time_out_buf)
@@ -1104,13 +1275,25 @@ class TTEnv(VecEnv):
         self.robot_future_pos = torch.where(
             self.mask_before.unsqueeze(-1), self.pos_pred_before_ro, self.pos_pred_after_ro
         )
-        self.robot_future_pos = torch.where(
-            mask_invalid_expanded,      # [N,3] bool
-            self.robot_future_pos.new_tensor(
+        if self.cfg.robot.use_fixed_target_xy_obs:
+            fixed_target_xy = self._get_fixed_target_xy(self.robot_pos)
+            invalid_robot_future_pos = torch.cat(
+                [
+                    fixed_target_xy,
+                    torch.full((self.num_envs, 1), body_height, device=self.device, dtype=self.robot_pos.dtype),
+                ],
+                dim=1,
+            )
+            self.robot_future_pos = invalid_robot_future_pos
+        else:
+            invalid_robot_future_pos = self.robot_future_pos.new_tensor(
                 [self.cfg.robot.future_invalid_robot_xy[0], self.cfg.robot.future_invalid_robot_xy[1], body_height]
-            ).expand_as(self.robot_future_pos),
-            self.robot_future_pos
-        )
+            ).expand_as(self.robot_future_pos)
+            self.robot_future_pos = torch.where(
+                mask_invalid_expanded,      # [N,3] bool
+                invalid_robot_future_pos,
+                self.robot_future_pos
+            )
 
         # self.vel_ro_before = torch.clamp((self.pos_pred_before_ro - self.robot_pos ) /torch.clamp(self.t_before.unsqueeze(-1).expand_as(self.ball_future_pose), min=0.2),min=-vel_max, max=vel_max)
         # self.vel_ro_after = torch.clamp((self.pos_pred_after_ro - self.robot_pos ) /torch.clamp(self.t_after.unsqueeze(-1).expand_as(self.ball_future_pose), min=0.2),min=-vel_max, max=vel_max)
@@ -1141,8 +1324,8 @@ class TTEnv(VecEnv):
             # self.update_robot_future_vel_visual()
             pass
     def init_obs_buffer(self):
+        actor_obs, _ = self.compute_current_observations()
         if self.add_noise:
-            actor_obs, _ = self.compute_current_observations()
             noise_vec = torch.zeros_like(actor_obs[0])
             noise_scales = self.cfg.noise.noise_scales
             noise_vec[:3] = noise_scales.ang_vel * self.obs_scales.ang_vel
@@ -1161,7 +1344,10 @@ class TTEnv(VecEnv):
             #ball prediction noise is set to zero
             noise_vec[6 + self.num_actions * 3 + 6: 6 + self.num_actions * 3 + 9] = 0.0
             noise_vec[6 + self.num_actions * 3 + 9: 6 + self.num_actions * 3 + 11] = noise_scales.perception * self.obs_scales.ball_pos 
-            noise_vec[6 + self.num_actions * 3 + 11] = noise_scales.projected_gravity * self.obs_scales.projected_gravity
+            heading_idx = 6 + self.num_actions * 3 + 11
+            noise_vec[heading_idx] = noise_scales.projected_gravity * self.obs_scales.projected_gravity
+            if getattr(self.cfg.robot, "actor_root_lin_vel_obs", False):
+                noise_vec[heading_idx + 1 : heading_idx + 4] = noise_scales.lin_vel * self.obs_scales.lin_vel
             self.noise_scale_vec = noise_vec
 
             if self.cfg.scene.height_scanner.enable_height_scan:
@@ -1180,7 +1366,10 @@ class TTEnv(VecEnv):
         self.critic_obs_buffer = CircularBuffer(
             max_len=self.cfg.robot.critic_obs_history_length, batch_size=self.num_envs, device=self.device
         )
-        self.delayed_perception = actor_obs[..., -self.num_perception:]
+        self.ball_pos = self.ball.data.root_pos_w - self.scene.env_origins
+        self.robot_pos = self.robot.data.root_link_pos_w - self.table.data.root_link_pos_w
+        self.current_perception = torch.cat([self.ball_pos, self.robot_pos], dim=-1)
+        self.delayed_perception = self.current_perception
 
     def update_terrain_levels(self, env_ids):
         distance = torch.norm(self.robot.data.root_pos_w[env_ids, :2] - self.scene.env_origins[env_ids, :2], dim=1)

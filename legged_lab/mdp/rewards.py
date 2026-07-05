@@ -86,6 +86,10 @@ def action_rate_l2(env: BaseEnv) -> torch.Tensor:
     )
 
 
+def action_l2(env: BaseEnv) -> torch.Tensor:
+    return torch.sum(torch.square(env.action_buffer._circular_buffer.buffer[:, -1, :]), dim=1)
+
+
 def undesired_contacts(env: BaseEnv, threshold: float, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     net_contact_forces = contact_sensor.data.net_forces_w_history
@@ -103,6 +107,471 @@ def fly(env: BaseEnv, threshold: float, sensor_cfg: SceneEntityCfg) -> torch.Ten
 def flat_orientation_l2(env: BaseEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+
+
+def penalty_robot_low_base_height(
+    env: BaseEnv,
+    min_z: float = 0.88,
+    std: float = 0.10,
+    max_penalty: float = 8.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    deficit = torch.clamp(min_z - root_z, min=0.0)
+    penalty = deficit.square() / (std * std + 1e-12)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def penalty_robot_low_base_height_barrier(
+    env: BaseEnv,
+    soft_min_z: float = 0.955,
+    hard_min_z: float = 0.900,
+    power: float = 2.0,
+    max_penalty: float = 4.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+
+    width = max(soft_min_z - hard_min_z, 1e-6)
+    progress = torch.clamp((soft_min_z - root_z) / width, min=0.0)
+    penalty = torch.pow(progress, power)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def penalty_robot_base_height_target_l2(
+    env: BaseEnv,
+    target_z: float = 0.965,
+    deadband: float = 0.012,
+    std: float = 0.070,
+    max_penalty: float = 8.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    error = torch.clamp(torch.abs(root_z - target_z) - deadband, min=0.0)
+    penalty = error.square() / (std * std + 1e-12)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def penalty_flat_orientation_margin(
+    env: BaseEnv,
+    max_flat_l2: float = 0.08,
+    std: float = 0.04,
+    max_penalty: float = 20.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    flat_l2 = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+    excess = torch.clamp(flat_l2 - max_flat_l2, min=0.0)
+    penalty = excess.square() / (std * std + 1e-12)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def penalty_stage1_bad_posture(
+    env: BaseEnv,
+    min_base_z: float = 0.935,
+    max_flat_l2: float = 0.045,
+    height_std: float = 0.050,
+    flat_std: float = 0.045,
+    max_penalty: float = 20.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    flat_l2 = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+    height_deficit = torch.clamp(min_base_z - root_z, min=0.0)
+    flat_excess = torch.clamp(flat_l2 - max_flat_l2, min=0.0)
+    height_penalty = height_deficit.square() / (height_std * height_std + 1e-12)
+    flat_penalty = flat_excess.square() / (flat_std * flat_std + 1e-12)
+    penalty = torch.clamp(height_penalty + flat_penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def reward_upright_exp(
+    env: BaseEnv,
+    std: float = 0.22,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    flat_l2 = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+    reward = torch.exp(-flat_l2 / (std * std + 1e-12))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_base_height_recovery_rate(
+    env: BaseEnv,
+    target_z: float = 0.965,
+    deadband: float = 0.012,
+    std: float = 0.040,
+    max_rate: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    prev_root_z = getattr(env, "stage1_prev_root_z", root_z)
+    prev_root_z = prev_root_z.to(device=root_z.device, dtype=root_z.dtype)
+
+    prev_error = torch.clamp(torch.abs(prev_root_z - target_z) - deadband, min=0.0)
+    current_error = torch.clamp(torch.abs(root_z - target_z) - deadband, min=0.0)
+    dt = max(float(getattr(env, "step_dt", 1.0)), 1e-6)
+    rate = (prev_error - current_error) / (std * dt + 1e-12)
+    rate = torch.clamp(rate, min=-max_rate, max=max_rate)
+    return torch.nan_to_num(rate, nan=0.0, posinf=max_rate, neginf=-max_rate)
+
+
+def reward_upright_recovery_rate(
+    env: BaseEnv,
+    deadband: float = 0.018,
+    std: float = 0.050,
+    max_rate: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    flat_l2 = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+    prev_flat_l2 = getattr(env, "stage1_prev_flat_l2", flat_l2)
+    prev_flat_l2 = prev_flat_l2.to(device=flat_l2.device, dtype=flat_l2.dtype)
+
+    prev_error = torch.clamp(prev_flat_l2 - deadband, min=0.0)
+    current_error = torch.clamp(flat_l2 - deadband, min=0.0)
+    dt = max(float(getattr(env, "step_dt", 1.0)), 1e-6)
+    rate = (prev_error - current_error) / (std * dt + 1e-12)
+    rate = torch.clamp(rate, min=-max_rate, max=max_rate)
+    return torch.nan_to_num(rate, nan=0.0, posinf=max_rate, neginf=-max_rate)
+
+
+def reward_alive(env: BaseEnv) -> torch.Tensor:
+    return (~env.reset_buf).float()
+
+
+def reward_alive_height_gated(
+    env: BaseEnv,
+    min_z: float = 0.78,
+    transition: float = 0.08,
+    floor: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    alive = reward_alive(env)
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    height_gate = torch.clamp((root_z - min_z) / (transition + 1e-12), min=0.0, max=1.0)
+    gate = floor + (1.0 - floor) * height_gate
+    return torch.nan_to_num(alive * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_robot_base_height_target(
+    env: BaseEnv,
+    target_z: float = 1.04,
+    std: float = 0.08,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    reward = torch.exp(-torch.square(root_z - target_z) / (std * std + 1e-12))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_robot_base_height_target_stability_gated(
+    env: BaseEnv,
+    target_z: float = 1.04,
+    std: float = 0.08,
+    gate_floor: float = 0.05,
+    score_kwargs: dict | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    reward = reward_robot_base_height_target(env, target_z=target_z, std=std, asset_cfg=asset_cfg)
+    gate = a3_stability_gate(env, gate_floor=gate_floor, score_kwargs=score_kwargs)
+    return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _robot_xy_and_target(
+    env: BaseEnv,
+    target_xy: Tuple[float, float],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        robot_xy = env.robot_pos[:, :2]
+    else:
+        robot_xy = asset.data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
+
+    cfg_robot = getattr(getattr(env, "cfg", None), "robot", None)
+    if (
+        getattr(cfg_robot, "use_fixed_target_xy_obs", False)
+        and hasattr(env, "fixed_target_xy")
+        and env.fixed_target_xy.shape[0] == robot_xy.shape[0]
+    ):
+        target = env.fixed_target_xy.to(device=robot_xy.device, dtype=robot_xy.dtype)
+    else:
+        target = robot_xy.new_tensor(target_xy).expand_as(robot_xy)
+    return robot_xy, target
+
+
+def reward_robot_xy_target(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.30, 0.35),
+    std: float = 0.24,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    robot_xy, target = _robot_xy_and_target(env, target_xy, asset_cfg)
+    error = torch.sum(torch.square(robot_xy - target), dim=1)
+    reward = torch.exp(-error / (std * std + 1e-12))
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_robot_xy_target_stability_gated(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.30, 0.35),
+    std: float = 0.24,
+    gate_floor: float = 0.05,
+    score_kwargs: dict | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    reward = reward_robot_xy_target(env, target_xy=target_xy, std=std, asset_cfg=asset_cfg)
+    gate = a3_stability_gate(env, gate_floor=gate_floor, score_kwargs=score_kwargs)
+    return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def penalty_robot_xy_drift(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.25, 0.35),
+    x_margin: float = 0.18,
+    y_margin: float = 0.30,
+    std: float = 0.12,
+    max_penalty: float = 10.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    robot_xy, target = _robot_xy_and_target(env, target_xy, asset_cfg)
+    overflow_y = torch.clamp(torch.abs(robot_xy[:, 1] - target[:, 1]) - y_margin, min=0.0)
+    overflow_x = torch.clamp(torch.abs(robot_xy[:, 0] - target[:, 0]) - x_margin, min=0.0)
+    penalty = (overflow_x.square() + overflow_y.square()) / (std * std + 1e-12)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def penalty_robot_x_upper_bound(
+    env: BaseEnv,
+    max_x: float = -1.55,
+    std: float = 0.12,
+    max_penalty: float = 8.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        robot_x = env.robot_pos[:, 0]
+    else:
+        robot_x = asset.data.root_pos_w[:, 0] - env.scene.env_origins[:, 0]
+    overflow = torch.clamp(robot_x - max_x, min=0.0)
+    penalty = overflow.square() / (std * std + 1e-12)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def penalty_robot_forward_x_velocity(
+    env: BaseEnv,
+    max_vx: float = 0.0,
+    std: float = 0.12,
+    max_penalty: float = 6.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    forward_vx = asset.data.root_lin_vel_w[:, 0]
+    overflow = torch.clamp(forward_vx - max_vx, min=0.0)
+    penalty = overflow.square() / (std * std + 1e-12)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def penalty_robot_forward_x_velocity_after_bound(
+    env: BaseEnv,
+    min_x: float = -1.70,
+    max_vx: float = 0.0,
+    x_std: float = 0.10,
+    vx_std: float = 0.12,
+    max_penalty: float = 8.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        robot_x = env.robot_pos[:, 0]
+    else:
+        robot_x = asset.data.root_pos_w[:, 0] - env.scene.env_origins[:, 0]
+    forward_vx = asset.data.root_lin_vel_w[:, 0]
+    x_gate = torch.clamp((robot_x - min_x) / (x_std + 1e-12), min=0.0, max=1.0)
+    overflow_vx = torch.clamp(forward_vx - max_vx, min=0.0)
+    penalty = x_gate * overflow_vx.square() / (vx_std * vx_std + 1e-12)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def reward_robot_xy_velocity_towards_target(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.25, 0.35),
+    activation_margin: float = 0.08,
+    max_speed: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    robot_xy, target = _robot_xy_and_target(env, target_xy, asset_cfg)
+    target_delta = target - robot_xy
+    distance = torch.linalg.norm(target_delta, dim=1)
+    direction = target_delta / torch.clamp(distance.unsqueeze(-1), min=1e-6)
+    progress_speed = torch.sum(asset.data.root_lin_vel_w[:, :2] * direction, dim=1)
+    reward = torch.clamp(progress_speed, min=0.0, max=max_speed) / (max_speed + 1e-12)
+    reward = reward * (distance > activation_margin).float()
+    return torch.nan_to_num(reward, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def reward_robot_xy_velocity_towards_target_stability_gated(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.25, 0.35),
+    activation_margin: float = 0.08,
+    max_speed: float = 0.35,
+    gate_floor: float = 0.05,
+    score_kwargs: dict | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    reward = reward_robot_xy_velocity_towards_target(
+        env,
+        target_xy=target_xy,
+        activation_margin=activation_margin,
+        max_speed=max_speed,
+        asset_cfg=asset_cfg,
+    )
+    gate = a3_stability_gate(env, gate_floor=gate_floor, score_kwargs=score_kwargs)
+    return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def penalty_robot_xy_velocity_away_from_target(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.25, 0.35),
+    activation_margin: float = 0.08,
+    std: float = 0.25,
+    max_penalty: float = 6.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    robot_xy, target = _robot_xy_and_target(env, target_xy, asset_cfg)
+    target_delta = target - robot_xy
+    distance = torch.linalg.norm(target_delta, dim=1)
+    direction = target_delta / torch.clamp(distance.unsqueeze(-1), min=1e-6)
+    progress_speed = torch.sum(asset.data.root_lin_vel_w[:, :2] * direction, dim=1)
+    away_speed = torch.clamp(-progress_speed, min=0.0)
+    penalty = away_speed.square() / (std * std + 1e-12)
+    penalty = penalty * (distance > activation_margin).float()
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def reward_robot_axis_velocity_towards_target(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.25, 0.35),
+    x_margin: float = 0.025,
+    y_margin: float = 0.025,
+    max_x_speed: float = 0.22,
+    max_y_speed: float = 0.18,
+    x_weight: float = 0.70,
+    y_weight: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    robot_xy, target = _robot_xy_and_target(env, target_xy, asset_cfg)
+    error = target - robot_xy
+    velocity_xy = asset.data.root_lin_vel_w[:, :2]
+
+    x_active = (torch.abs(error[:, 0]) > x_margin).float()
+    y_active = (torch.abs(error[:, 1]) > y_margin).float()
+    x_progress = torch.sign(error[:, 0]) * velocity_xy[:, 0]
+    y_progress = torch.sign(error[:, 1]) * velocity_xy[:, 1]
+    x_reward = torch.clamp(x_progress, min=0.0, max=max_x_speed) / (max_x_speed + 1e-12)
+    y_reward = torch.clamp(y_progress, min=0.0, max=max_y_speed) / (max_y_speed + 1e-12)
+
+    weight_sum = x_weight * x_active + y_weight * y_active + 1e-12
+    reward = (x_weight * x_active * x_reward + y_weight * y_active * y_reward) / weight_sum
+    return torch.nan_to_num(reward, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def reward_robot_axis_velocity_towards_target_stability_gated(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.25, 0.35),
+    x_margin: float = 0.025,
+    y_margin: float = 0.025,
+    max_x_speed: float = 0.22,
+    max_y_speed: float = 0.18,
+    x_weight: float = 0.70,
+    y_weight: float = 0.30,
+    gate_floor: float = 0.0,
+    score_kwargs: dict | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    reward = reward_robot_axis_velocity_towards_target(
+        env,
+        target_xy=target_xy,
+        x_margin=x_margin,
+        y_margin=y_margin,
+        max_x_speed=max_x_speed,
+        max_y_speed=max_y_speed,
+        x_weight=x_weight,
+        y_weight=y_weight,
+        asset_cfg=asset_cfg,
+    )
+    gate = a3_stability_gate(env, gate_floor=gate_floor, score_kwargs=score_kwargs)
+    return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def penalty_robot_axis_velocity_away_from_target(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.25, 0.35),
+    x_margin: float = 0.025,
+    y_margin: float = 0.025,
+    x_std: float = 0.16,
+    y_std: float = 0.14,
+    x_weight: float = 0.72,
+    y_weight: float = 0.28,
+    max_penalty: float = 8.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    robot_xy, target = _robot_xy_and_target(env, target_xy, asset_cfg)
+    error = target - robot_xy
+    velocity_xy = asset.data.root_lin_vel_w[:, :2]
+
+    x_active = (torch.abs(error[:, 0]) > x_margin).float()
+    y_active = (torch.abs(error[:, 1]) > y_margin).float()
+    x_away = torch.clamp(-torch.sign(error[:, 0]) * velocity_xy[:, 0], min=0.0)
+    y_away = torch.clamp(-torch.sign(error[:, 1]) * velocity_xy[:, 1], min=0.0)
+    x_penalty = x_away.square() / (x_std * x_std + 1e-12)
+    y_penalty = y_away.square() / (y_std * y_std + 1e-12)
+
+    penalty = x_weight * x_active * x_penalty + y_weight * y_active * y_penalty
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
 
 
 def is_terminated(env: BaseEnv) -> torch.Tensor:
@@ -1515,6 +1984,70 @@ def reward_standing_stability(
         + feet_width_weight * scores["feet_width"]
     ) / total_weight
     return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_standing_stability_height_gated(
+    env: TTEnv,
+    min_z: float = 0.72,
+    transition: float = 0.08,
+    floor: float = 0.0,
+    height_weight: float = 0.28,
+    upright_weight: float = 0.24,
+    support_weight: float = 0.20,
+    velocity_weight: float = 0.14,
+    clean_weight: float = 0.09,
+    feet_width_weight: float = 0.05,
+    score_kwargs: dict | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+
+    stability = reward_standing_stability(
+        env,
+        height_weight=height_weight,
+        upright_weight=upright_weight,
+        support_weight=support_weight,
+        velocity_weight=velocity_weight,
+        clean_weight=clean_weight,
+        feet_width_weight=feet_width_weight,
+        score_kwargs=score_kwargs,
+    )
+    height_gate = torch.clamp((root_z - min_z) / (transition + 1e-12), min=0.0, max=1.0)
+    gate = floor + (1.0 - floor) * height_gate
+    return torch.nan_to_num(stability * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_standing_stability_xy_gated(
+    env: TTEnv,
+    target_xy: Tuple[float, float] = (-1.86, 0.35),
+    xy_std: float = 0.24,
+    xy_floor: float = 0.03,
+    height_weight: float = 0.28,
+    upright_weight: float = 0.24,
+    support_weight: float = 0.20,
+    velocity_weight: float = 0.14,
+    clean_weight: float = 0.09,
+    feet_width_weight: float = 0.05,
+    score_kwargs: dict | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    stability = reward_standing_stability(
+        env,
+        height_weight=height_weight,
+        upright_weight=upright_weight,
+        support_weight=support_weight,
+        velocity_weight=velocity_weight,
+        clean_weight=clean_weight,
+        feet_width_weight=feet_width_weight,
+        score_kwargs=score_kwargs,
+    )
+    xy_score = reward_robot_xy_target(env, target_xy=target_xy, std=xy_std, asset_cfg=asset_cfg)
+    gate = xy_floor + (1.0 - xy_floor) * xy_score
+    return torch.nan_to_num(stability * gate, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def penalty_unstable_hit(env: TTEnv, score_kwargs: dict | None = None) -> torch.Tensor:

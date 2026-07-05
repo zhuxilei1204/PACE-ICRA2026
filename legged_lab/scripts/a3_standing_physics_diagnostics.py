@@ -94,6 +94,40 @@ def _leg_pose(hip_pitch: float, knee: float, ankle_pitch: float) -> dict[str, fl
     }
 
 
+def _a3_stable_wide_legs() -> dict[str, float]:
+    return {
+        "left_hip_pitch_joint": -0.05,
+        "left_hip_roll_joint": 0.16,
+        "left_hip_yaw_joint": 0.0,
+        "left_knee_joint": 0.50,
+        "left_ankle_pitch_joint": -0.22,
+        "left_ankle_roll_joint": -0.072,
+        "right_hip_pitch_joint": -0.05,
+        "right_hip_roll_joint": -0.16,
+        "right_hip_yaw_joint": 0.0,
+        "right_knee_joint": 0.50,
+        "right_ankle_pitch_joint": -0.22,
+        "right_ankle_roll_joint": 0.072,
+    }
+
+
+def _a3_pingpong_ready_legs() -> dict[str, float]:
+    return {
+        "left_hip_pitch_joint": -0.18,
+        "left_hip_roll_joint": -0.16,
+        "left_hip_yaw_joint": 0.0,
+        "left_knee_joint": 0.50,
+        "left_ankle_pitch_joint": -0.26,
+        "left_ankle_roll_joint": 0.072,
+        "right_hip_pitch_joint": -0.18,
+        "right_hip_roll_joint": 0.16,
+        "right_hip_yaw_joint": 0.0,
+        "right_knee_joint": 0.50,
+        "right_ankle_pitch_joint": -0.26,
+        "right_ankle_roll_joint": -0.072,
+    }
+
+
 def _ready_arms() -> dict[str, float]:
     return {
         "left_shoulder_pitch_joint": 0.15,
@@ -149,6 +183,10 @@ def _pose_overrides(name: str) -> dict[str, float]:
         pose = _leg_pose(-0.20, 0.42, -0.23)
         pose.update(_ready_arms())
         return pose
+    if name == "a3_stable_wide":
+        return _a3_stable_wide_legs()
+    if name == "a3_pingpong_ready_legs":
+        return _a3_pingpong_ready_legs()
     if name == "zero_light_crouch":
         pose = _leg_pose(-0.12, 0.25, -0.14)
         pose.update(_zero_arms())
@@ -159,7 +197,8 @@ def _pose_overrides(name: str) -> dict[str, float]:
         return pose
     raise ValueError(
         f"Unsupported --pose {name!r}. Valid: current, zero_leg, light_crouch, "
-        "t1_like, ready_light_crouch, ready_t1_like, zero_light_crouch, zero_t1_like."
+        "t1_like, ready_light_crouch, ready_t1_like, a3_stable_wide, "
+        "a3_pingpong_ready_legs, zero_light_crouch, zero_t1_like."
     )
 
 
@@ -195,6 +234,7 @@ def _configure_env(env_cfg, args: argparse.Namespace, num_envs: int) -> None:
 
     env_cfg.noise.add_noise = True
     for attr in (
+        "lin_vel",
         "ang_vel",
         "projected_gravity",
         "joint_pos",
@@ -286,7 +326,15 @@ def _apply_pose(
     env.sim.forward()
 
     default_targets = env.robot.data.default_joint_pos[:, env.action_joint_ids]
-    actions = (joint_pos[:, env.action_joint_ids] - default_targets) / env.action_scale
+    target_delta = joint_pos[:, env.action_joint_ids] - default_targets
+    action_scale = torch.as_tensor(env.action_scale, dtype=target_delta.dtype, device=target_delta.device)
+    if action_scale.ndim == 0:
+        actions = target_delta / action_scale if torch.abs(action_scale) > 1e-8 else torch.zeros_like(target_delta)
+    else:
+        action_scale = action_scale.reshape(1, -1)
+        actions = torch.zeros_like(target_delta)
+        nonzero_scale = (torch.abs(action_scale) > 1e-8).squeeze(0)
+        actions[:, nonzero_scale] = target_delta[:, nonzero_scale] / action_scale[:, nonzero_scale]
     actions = torch.clamp(actions, -env.clip_actions, env.clip_actions)
     return actions, root_pose, joint_pos
 
@@ -558,7 +606,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--env_spacing", type=float, default=4.0)
     parser.add_argument("--print_interval", type=int, default=25)
-    parser.add_argument("--base_x", type=float, default=-0.26)
+    parser.add_argument("--base_x", type=float, default=0.16)
     parser.add_argument("--base_y", type=float, default=0.35)
     parser.add_argument("--base_yaw", type=float, default=0.0)
     parser.add_argument("--contact_threshold", type=float, default=1.0)

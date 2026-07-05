@@ -72,6 +72,8 @@ class OnPolicyRunner:
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
+        if self.cfg.get("zero_actor_output", False):
+            self._zero_actor_output_layer(policy)
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
@@ -136,6 +138,22 @@ class OnPolicyRunner:
             self._serve_success_flag = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device)
         except Exception:
             self._serve_success_flag = None
+
+    def _zero_actor_output_layer(self, policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent):
+        actor = getattr(policy, "actor", None)
+        if actor is None:
+            raise ValueError("zero_actor_output=True requires the policy to expose an actor network.")
+        output_layer = None
+        for module in reversed(list(actor.modules())):
+            if isinstance(module, torch.nn.Linear):
+                output_layer = module
+                break
+        if output_layer is None:
+            raise ValueError("zero_actor_output=True could not find a linear actor output layer.")
+        torch.nn.init.zeros_(output_layer.weight)
+        if output_layer.bias is not None:
+            torch.nn.init.zeros_(output_layer.bias)
+        print("[INFO] zero_actor_output=True: initialized actor output layer to zero.")
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer

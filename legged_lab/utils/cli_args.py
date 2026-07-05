@@ -42,6 +42,15 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument(
         "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
     )
+    arg_group.add_argument("--learning_rate", type=float, default=None, help="Override PPO learning rate.")
+    arg_group.add_argument("--desired_kl", type=float, default=None, help="Override PPO desired KL.")
+    arg_group.add_argument("--clip_param", type=float, default=None, help="Override PPO clipping parameter.")
+    arg_group.add_argument("--value_loss_coef", type=float, default=None, help="Override PPO value loss coefficient.")
+    arg_group.add_argument("--num_learning_epochs", type=int, default=None, help="Override PPO learning epochs.")
+    arg_group.add_argument("--num_mini_batches", type=int, default=None, help="Override PPO mini batches.")
+    arg_group.add_argument("--mean_action_l2_coef", type=float, default=None, help="Override PPO mean-action L2 coefficient.")
+    arg_group.add_argument("--freeze_actor", type=bool, default=None, help="Freeze PPO actor and train critic only.")
+    arg_group.add_argument("--deterministic_actions", type=bool, default=None, help="Use action means during PPO rollout.")
 
 
 def update_rsl_rl_cfg(agent_cfg: BaseAgentConfig, args_cli: argparse.Namespace):
@@ -69,5 +78,26 @@ def update_rsl_rl_cfg(agent_cfg: BaseAgentConfig, args_cli: argparse.Namespace):
     if agent_cfg.logger in {"wandb", "neptune"} and args_cli.log_project_name:
         agent_cfg.wandb_project = args_cli.log_project_name
         agent_cfg.neptune_project = args_cli.log_project_name
+
+    algorithm = getattr(agent_cfg, "algorithm", None)
+    if algorithm is not None:
+        if args_cli.learning_rate is not None:
+            algorithm.learning_rate = args_cli.learning_rate
+        if args_cli.desired_kl is not None:
+            algorithm.desired_kl = args_cli.desired_kl
+        if args_cli.clip_param is not None:
+            algorithm.clip_param = args_cli.clip_param
+        if args_cli.value_loss_coef is not None:
+            algorithm.value_loss_coef = args_cli.value_loss_coef
+        if args_cli.num_learning_epochs is not None:
+            algorithm.num_learning_epochs = args_cli.num_learning_epochs
+        if args_cli.num_mini_batches is not None:
+            algorithm.num_mini_batches = args_cli.num_mini_batches
+        if args_cli.mean_action_l2_coef is not None:
+            algorithm.mean_action_l2_coef = args_cli.mean_action_l2_coef
+        if args_cli.freeze_actor is not None:
+            algorithm.freeze_actor = args_cli.freeze_actor
+        if args_cli.deterministic_actions is not None:
+            algorithm.deterministic_actions = args_cli.deterministic_actions
 
     return agent_cfg

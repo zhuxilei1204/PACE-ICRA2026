@@ -72,6 +72,21 @@ class RobotCfg:
     future_paddle_x_offset: float = 0.10
     future_paddle_y_offset: float = -0.60
     future_invalid_robot_xy: tuple = (-1.80, 0.30)
+    use_fixed_target_xy_obs: bool = False
+    fixed_target_xy_x_range: tuple | None = None
+    fixed_target_xy_y_range: tuple | None = None
+    default_joint_pos_override: dict | None = None
+    termination_min_base_z: float = 0.50
+    termination_max_flat_orientation_l2: float | None = None
+    termination_robot_x_range: tuple = (-3.60, -1.35)
+    termination_robot_y_range: tuple = (-1.10, 1.10)
+    actor_root_lin_vel_obs: bool = False
+    stage1_recovery_obs: bool = False
+    stage1_recovery_target_z: float = 0.965
+    stage1_recovery_flat_deadband: float = 0.018
+    stage1_bad_posture_min_base_z: float = 0.0
+    stage1_bad_posture_max_flat_orientation_l2: float = 0.0
+    stage1_bad_posture_max_steps: int = 0
 
 @configclass
 class BallCfg:
@@ -140,6 +155,7 @@ class CommandsCfg:
 
 @configclass
 class NoiseScalesCfg:
+    lin_vel: float = 0.2
     ang_vel: float = 0.2
     projected_gravity: float = 0.05
     joint_pos: float = 0.01

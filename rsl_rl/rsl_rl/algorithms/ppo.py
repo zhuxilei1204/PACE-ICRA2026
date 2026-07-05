@@ -45,6 +45,9 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        mean_action_l2_coef: float = 0.0,
+        deterministic_actions: bool = False,
+        freeze_actor: bool = False,
     ):
         # device-related parameters
         self.device = device
@@ -92,6 +95,17 @@ class PPO:
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
+        self.freeze_actor = freeze_actor
+        if self.freeze_actor:
+            actor = getattr(self.policy, "actor", None)
+            if actor is None:
+                raise ValueError("freeze_actor=True requires the policy to expose an actor network.")
+            for param in actor.parameters():
+                param.requires_grad_(False)
+            for attr in ("std", "log_std"):
+                param = getattr(self.policy, attr, None)
+                if isinstance(param, nn.Parameter):
+                    param.requires_grad_(False)
         # Create optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # Create rollout storage
@@ -112,6 +126,8 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.mean_action_l2_coef = mean_action_l2_coef
+        self.deterministic_actions = deterministic_actions
 
     def init_storage(
         self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape
@@ -137,7 +153,11 @@ class PPO:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
+        sampled_actions = self.policy.act(obs)
+        if self.deterministic_actions:
+            self.transition.actions = self.policy.action_mean.detach()
+        else:
+            self.transition.actions = sampled_actions.detach()
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
@@ -187,6 +207,7 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_action_l2 = 0
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -264,6 +285,7 @@ class PPO:
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
+            mean_action_l2_loss = torch.square(mu_batch).sum(dim=-1).mean()
 
             # KL
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -322,6 +344,8 @@ class PPO:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            if self.mean_action_l2_coef > 0.0:
+                loss += self.mean_action_l2_coef * mean_action_l2_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -392,6 +416,7 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            mean_action_l2 += mean_action_l2_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -404,6 +429,7 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_action_l2 /= num_updates
         # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -419,6 +445,8 @@ class PPO:
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if self.mean_action_l2_coef > 0.0:
+            loss_dict["mean_action_l2"] = mean_action_l2
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

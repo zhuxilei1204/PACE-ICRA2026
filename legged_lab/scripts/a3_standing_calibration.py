@@ -144,6 +144,7 @@ class Result:
     survived: bool
     reset_seen: bool
     max_abs_roll_pitch: float
+    max_root_xy_drift: float
     max_root_z_drift: float
     max_foot_slip: float
     both_feet_contact_ratio: float
@@ -455,6 +456,7 @@ def _configure_env(env_cfg, args: argparse.Namespace, num_envs: int) -> None:
 
     env_cfg.noise.add_noise = True
     for attr in (
+        "lin_vel",
         "ang_vel",
         "projected_gravity",
         "joint_pos",
@@ -473,8 +475,8 @@ def _configure_env(env_cfg, args: argparse.Namespace, num_envs: int) -> None:
     if env_cfg.domain_rand.events.add_base_mass is not None:
         env_cfg.domain_rand.events.add_base_mass.params["mass_distribution_params"] = (0.0, 0.0)
     if env_cfg.domain_rand.events.physics_material is not None:
-        env_cfg.domain_rand.events.physics_material.params["static_friction_range"] = (1.0, 1.0)
-        env_cfg.domain_rand.events.physics_material.params["dynamic_friction_range"] = (1.0, 1.0)
+        env_cfg.domain_rand.events.physics_material.params["static_friction_range"] = (args.friction, args.friction)
+        env_cfg.domain_rand.events.physics_material.params["dynamic_friction_range"] = (args.friction, args.friction)
         env_cfg.domain_rand.events.physics_material.params["restitution_range"] = (0.0, 0.0)
     env_cfg.domain_rand.perception_delay.enable = False
     env_cfg.domain_rand.action_delay.enable = False
@@ -580,7 +582,15 @@ def _apply_candidates(env, candidates: list[Candidate]) -> tuple[torch.Tensor, t
     env.sim.forward()
 
     default_targets = env.robot.data.default_joint_pos[: len(candidates), env.action_joint_ids]
-    target_actions = (joint_pos[:, env.action_joint_ids] - default_targets) / env.action_scale
+    target_delta = joint_pos[:, env.action_joint_ids] - default_targets
+    action_scale = torch.as_tensor(env.action_scale, dtype=target_delta.dtype, device=target_delta.device)
+    if action_scale.ndim == 0:
+        target_actions = target_delta / action_scale if torch.abs(action_scale) > 1e-8 else torch.zeros_like(target_delta)
+    else:
+        action_scale = action_scale.reshape(1, -1)
+        target_actions = torch.zeros_like(target_delta)
+        nonzero_scale = (torch.abs(action_scale) > 1e-8).squeeze(0)
+        target_actions[:, nonzero_scale] = target_delta[:, nonzero_scale] / action_scale[:, nonzero_scale]
     target_actions = torch.clamp(target_actions, -env.clip_actions, env.clip_actions)
     return target_actions, root_pose[:, :3].clone(), joint_pos
 
@@ -597,6 +607,7 @@ def _score_results(results: list[Result], trial_steps: int) -> None:
             1000.0 * survival_ratio
             + 90.0 * result.both_feet_contact_ratio
             - 180.0 * result.max_abs_roll_pitch
+            - 320.0 * result.max_root_xy_drift
             - 180.0 * result.max_root_z_drift
             - 80.0 * result.max_foot_slip
             - 25.0 * result.min_paddle_future_dist
@@ -620,6 +631,7 @@ def _write_csv(path: Path, results: list[Result]) -> None:
                 "root_z",
                 "final_root_z",
                 "max_abs_roll_pitch",
+                "max_root_xy_drift",
                 "max_root_z_drift",
                 "max_foot_slip",
                 "both_feet_contact_ratio",
@@ -642,6 +654,7 @@ def _write_csv(path: Path, results: list[Result]) -> None:
                     f"{result.candidate.root_z:.6f}",
                     f"{result.final_root_z:.6f}",
                     f"{result.max_abs_roll_pitch:.6f}",
+                    f"{result.max_root_xy_drift:.6f}",
                     f"{result.max_root_z_drift:.6f}",
                     f"{result.max_foot_slip:.6f}",
                     f"{result.both_feet_contact_ratio:.6f}",
@@ -658,7 +671,7 @@ def _print_top_results(results: list[Result], top_k: int, trial_steps: int) -> N
     print("\n[A3 Standing Calibration] Top candidates")
     print(
         "rank  id    score    steps  ok  reset  rollpitch  z_drift  foot_slip  "
-        "contact  final_pitch  paddle_future  name"
+        "xy_drift  contact  final_pitch  paddle_future  name"
     )
     for rank, result in enumerate(results[:top_k], start=1):
         print(
@@ -666,7 +679,8 @@ def _print_top_results(results: list[Result], top_k: int, trial_steps: int) -> N
             f"{result.survival_steps:>5}/{trial_steps:<5}  "
             f"{int(result.survived):>2}  {int(result.reset_seen):>5}  "
             f"{result.max_abs_roll_pitch:>9.4f}  {result.max_root_z_drift:>7.4f}  "
-            f"{result.max_foot_slip:>9.4f}  {result.both_feet_contact_ratio:>7.3f}  "
+            f"{result.max_foot_slip:>9.4f}  {result.max_root_xy_drift:>8.4f}  "
+            f"{result.both_feet_contact_ratio:>7.3f}  "
             f"{result.final_pitch:>11.4f}  "
             f"{result.min_paddle_future_dist:>13.4f}  {result.candidate.name}"
         )
@@ -682,9 +696,13 @@ def _print_top_results(results: list[Result], top_k: int, trial_steps: int) -> N
 
 
 def _evaluate(env, candidates: list[Candidate], args: argparse.Namespace, simulation_app=None) -> list[Result]:
-    actions, initial_root_pos, _ = _apply_candidates(env, candidates)
+    actions, initial_root_pos, joint_pos = _apply_candidates(env, candidates)
     num_envs = len(candidates)
     device = env.device
+    if args.candidate_as_default:
+        env.robot.data.default_joint_pos[:num_envs] = joint_pos
+        env.robot.data.default_joint_vel[:num_envs] = 0.0
+        actions = torch.zeros((num_envs, env.num_actions), dtype=torch.float, device=device)
 
     foot_body_ids, _ = env.robot.find_bodies(env.cfg.robot.feet_body_names, preserve_order=True)
     initial_feet_xy = env.robot.data.body_pos_w[:num_envs, foot_body_ids, :2].detach().clone()
@@ -693,6 +711,7 @@ def _evaluate(env, candidates: list[Candidate], args: argparse.Namespace, simula
     survival_steps = torch.zeros(num_envs, dtype=torch.long, device=device)
     reset_seen = torch.zeros(num_envs, dtype=torch.bool, device=device)
     max_abs_roll_pitch = torch.zeros(num_envs, dtype=torch.float, device=device)
+    max_root_xy_drift = torch.zeros(num_envs, dtype=torch.float, device=device)
     max_root_z_drift = torch.zeros(num_envs, dtype=torch.float, device=device)
     max_foot_slip = torch.zeros(num_envs, dtype=torch.float, device=device)
     both_feet_contact_steps = torch.zeros(num_envs, dtype=torch.float, device=device)
@@ -707,6 +726,10 @@ def _evaluate(env, candidates: list[Candidate], args: argparse.Namespace, simula
             active_before = alive.clone()
             roll, pitch, _ = _euler_xyz_from_quat_wxyz(env.robot.data.root_quat_w[:num_envs])
             abs_roll_pitch = torch.maximum(torch.abs(roll), torch.abs(pitch))
+            root_xy_drift = torch.linalg.norm(
+                env.robot.data.root_pos_w[:num_envs, :2] - initial_root_pos[:, :2],
+                dim=1,
+            )
             root_z_drift = torch.abs(env.robot.data.root_pos_w[:num_envs, 2] - initial_root_pos[:, 2])
             feet_contact = _feet_contact(env, args.contact_threshold)[:num_envs]
             both_feet_contact = feet_contact.all(dim=1)
@@ -716,6 +739,7 @@ def _evaluate(env, candidates: list[Candidate], args: argparse.Namespace, simula
             paddle_future_dist = torch.linalg.norm(paddle_env - env.ball_future_pose[:num_envs], dim=1)
 
             max_abs_roll_pitch = torch.maximum(max_abs_roll_pitch, torch.where(active_before, abs_roll_pitch, 0.0))
+            max_root_xy_drift = torch.maximum(max_root_xy_drift, torch.where(active_before, root_xy_drift, 0.0))
             max_root_z_drift = torch.maximum(max_root_z_drift, torch.where(active_before, root_z_drift, 0.0))
             max_foot_slip = torch.maximum(max_foot_slip, torch.where(active_before, foot_slip, 0.0))
             min_pitch = torch.minimum(min_pitch, torch.where(active_before, pitch, min_pitch))
@@ -729,6 +753,7 @@ def _evaluate(env, candidates: list[Candidate], args: argparse.Namespace, simula
             failed_now = (
                 reset_buf[:num_envs]
                 | (abs_roll_pitch > args.max_abs_roll_pitch)
+                | (root_xy_drift > args.max_root_xy_drift)
                 | (env.robot.data.root_pos_w[:num_envs, 2] < args.min_root_z)
                 | (root_z_drift > args.max_root_z_drift)
             )
@@ -769,6 +794,7 @@ def _evaluate(env, candidates: list[Candidate], args: argparse.Namespace, simula
                 survived=bool(alive[i].detach().cpu()) and int(survival_steps[i].detach().cpu()) >= args.trial_steps,
                 reset_seen=bool(reset_seen[i].detach().cpu()),
                 max_abs_roll_pitch=float(max_abs_roll_pitch[i].detach().cpu()),
+                max_root_xy_drift=float(max_root_xy_drift[i].detach().cpu()),
                 max_root_z_drift=float(max_root_z_drift[i].detach().cpu()),
                 max_foot_slip=float(max_foot_slip[i].detach().cpu()),
                 both_feet_contact_ratio=float(contact_ratio[i].detach().cpu()),
@@ -824,10 +850,17 @@ def main() -> None:
         default="",
         help="Optional JSON with 'layout' and 'q'. Enables measured full-pose and measured upper-body candidates.",
     )
-    parser.add_argument("--base_x", type=float, default=-0.26, help="Reset x offset relative to robot init pose.")
+    parser.add_argument("--base_x", type=float, default=0.16, help="Reset x offset relative to robot init pose.")
     parser.add_argument("--base_y", type=float, default=0.35, help="Reset y offset relative to robot init pose.")
     parser.add_argument("--base_yaw", type=float, default=0.0)
+    parser.add_argument("--friction", type=float, default=1.0)
+    parser.add_argument(
+        "--candidate_as_default",
+        action="store_true",
+        help="Evaluate each candidate as the zero-action default pose instead of holding it with action offsets.",
+    )
     parser.add_argument("--max_abs_roll_pitch", type=float, default=0.55)
+    parser.add_argument("--max_root_xy_drift", type=float, default=0.35)
     parser.add_argument("--max_root_z_drift", type=float, default=0.22)
     parser.add_argument("--min_root_z", type=float, default=0.50)
     parser.add_argument("--contact_threshold", type=float, default=1.0)

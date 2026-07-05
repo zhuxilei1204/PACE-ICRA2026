@@ -38,6 +38,12 @@ from legged_lab.envs.a3_tt.a3_tt_config import (
     A3Stage5ReadyEnvCfg,
     A3Stage5ReadyEvalEnvCfg,
     A3Stage5ReadyAgentCfg,
+    A3Stage1BalanceMoveEnvCfg,
+    A3Stage1BalanceMoveEvalEnvCfg,
+    A3Stage1BalanceMoveAgentCfg,
+    A3Stage1StandEnvCfg,
+    A3Stage1StandEvalEnvCfg,
+    A3Stage1StandAgentCfg,
     A3Stage5bEnvCfg,
     A3Stage5bEvalEnvCfg,
     A3Stage5bAgentCfg,
@@ -98,6 +104,10 @@ task_registry.register("a3_tt_stage4d", TTEnv, A3Stage4dEnvCfg(), A3Stage4dAgent
 task_registry.register("a3_tt_stage4d_eval", TTEnv, A3Stage4dEvalEnvCfg(), A3Stage4dAgentCfg())
 task_registry.register("a3_tt_stage5_ready", TTEnv, A3Stage5ReadyEnvCfg(), A3Stage5ReadyAgentCfg())
 task_registry.register("a3_tt_stage5_ready_eval", TTEnv, A3Stage5ReadyEvalEnvCfg(), A3Stage5ReadyAgentCfg())
+task_registry.register("a3_tt_stage1_balance_move", TTEnv, A3Stage1BalanceMoveEnvCfg(), A3Stage1BalanceMoveAgentCfg())
+task_registry.register("a3_tt_stage1_balance_move_eval", TTEnv, A3Stage1BalanceMoveEvalEnvCfg(), A3Stage1BalanceMoveAgentCfg())
+task_registry.register("a3_tt_stage1_stand", TTEnv, A3Stage1StandEnvCfg(), A3Stage1StandAgentCfg())
+task_registry.register("a3_tt_stage1_stand_eval", TTEnv, A3Stage1StandEvalEnvCfg(), A3Stage1StandAgentCfg())
 task_registry.register("a3_tt_stage5b", TTEnv, A3Stage5bEnvCfg(), A3Stage5bAgentCfg())
 task_registry.register("a3_tt_stage5b_eval", TTEnv, A3Stage5bEvalEnvCfg(), A3Stage5bAgentCfg())
 task_registry.register("a3_tt_stage5c", TTEnv, A3Stage5cEnvCfg(), A3Stage5cAgentCfg())
