@@ -44,6 +44,12 @@ from legged_lab.envs.a3_tt.a3_tt_config import (
     A3Stage1StandEnvCfg,
     A3Stage1StandEvalEnvCfg,
     A3Stage1StandAgentCfg,
+    A3Stage1RecoveryStandEnvCfg,
+    A3Stage1RecoveryStandEvalEnvCfg,
+    A3Stage1RecoveryStandAgentCfg,
+    A3Stage1LateralMoveEnvCfg,
+    A3Stage1LateralMoveEvalEnvCfg,
+    A3Stage1LateralMoveAgentCfg,
     A3Stage5bEnvCfg,
     A3Stage5bEvalEnvCfg,
     A3Stage5bAgentCfg,
@@ -108,6 +114,20 @@ task_registry.register("a3_tt_stage1_balance_move", TTEnv, A3Stage1BalanceMoveEn
 task_registry.register("a3_tt_stage1_balance_move_eval", TTEnv, A3Stage1BalanceMoveEvalEnvCfg(), A3Stage1BalanceMoveAgentCfg())
 task_registry.register("a3_tt_stage1_stand", TTEnv, A3Stage1StandEnvCfg(), A3Stage1StandAgentCfg())
 task_registry.register("a3_tt_stage1_stand_eval", TTEnv, A3Stage1StandEvalEnvCfg(), A3Stage1StandAgentCfg())
+task_registry.register(
+    "a3_tt_stage1_recovery_stand",
+    TTEnv,
+    A3Stage1RecoveryStandEnvCfg(),
+    A3Stage1RecoveryStandAgentCfg(),
+)
+task_registry.register(
+    "a3_tt_stage1_recovery_stand_eval",
+    TTEnv,
+    A3Stage1RecoveryStandEvalEnvCfg(),
+    A3Stage1RecoveryStandAgentCfg(),
+)
+task_registry.register("a3_tt_stage1_lateral_move", TTEnv, A3Stage1LateralMoveEnvCfg(), A3Stage1LateralMoveAgentCfg())
+task_registry.register("a3_tt_stage1_lateral_move_eval", TTEnv, A3Stage1LateralMoveEvalEnvCfg(), A3Stage1LateralMoveAgentCfg())
 task_registry.register("a3_tt_stage5b", TTEnv, A3Stage5bEnvCfg(), A3Stage5bAgentCfg())
 task_registry.register("a3_tt_stage5b_eval", TTEnv, A3Stage5bEvalEnvCfg(), A3Stage5bAgentCfg())
 task_registry.register("a3_tt_stage5c", TTEnv, A3Stage5cEnvCfg(), A3Stage5cAgentCfg())

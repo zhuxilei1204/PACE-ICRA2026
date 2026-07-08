@@ -14,6 +14,7 @@ import isaacsim.core.utils.torch as torch_utils  # type: ignore
 import isaaclab.utils.math as math_utils
 import numpy as np
 import torch
+from isaacsim.core.simulation_manager import SimulationManager
 from isaaclab.assets.articulation import Articulation
 from isaaclab.assets.rigid_object import RigidObject
 from isaaclab.assets.rigid_object import RigidObjectCfg
@@ -175,6 +176,7 @@ class TTEnv(VecEnv):
         scene_cfg = TTSceneCfg(config=cfg.scene, physics_dt=self.physics_dt, step_dt=self.step_dt)
         self.scene = InteractiveScene(scene_cfg)
         self.sim.reset()
+        self._ensure_scene_entities_initialized()
 
         self.robot: Articulation = self.scene["robot"]
         self.table: RigidObject = self.scene["table"]
@@ -224,6 +226,79 @@ class TTEnv(VecEnv):
     def __del__(self):
         """Cleanup for the environment."""
         self.close()
+
+    def _scene_entities_for_initialization(self):
+        """Return scene entities whose simulation handles must exist after reset."""
+        entities = []
+        entities.extend((f"articulation:{name}", entity) for name, entity in self.scene.articulations.items())
+        entities.extend((f"rigid_object:{name}", entity) for name, entity in self.scene.rigid_objects.items())
+        entities.extend((f"sensor:{name}", entity) for name, entity in self.scene.sensors.items())
+        return entities
+
+    @staticmethod
+    def _entity_has_physx_view(entity) -> bool:
+        try:
+            view = getattr(entity, "root_physx_view")
+        except Exception:
+            return False
+        if view is None:
+            return False
+        return getattr(view, "_backend", True) is not None
+
+    def _uninitialized_scene_entities(self):
+        missing = []
+        for name, entity in self._scene_entities_for_initialization():
+            initialized = bool(getattr(entity, "is_initialized", True))
+            if hasattr(entity, "root_physx_view") and not self._entity_has_physx_view(entity):
+                initialized = False
+            if not initialized:
+                missing.append((name, entity))
+        return missing
+
+    def _ensure_physics_sim_view(self) -> bool:
+        if SimulationManager.get_physics_sim_view() is not None:
+            return True
+        try:
+            SimulationManager._warm_start(None)
+        except Exception:
+            pass
+        try:
+            self.sim.app.update()
+        except Exception:
+            pass
+        return SimulationManager.get_physics_sim_view() is not None
+
+    def _ensure_scene_entities_initialized(self, max_attempts: int = 8) -> None:
+        """Wait for Isaac/PhysX callbacks to initialize scene entities.
+
+        In livestream/WebRTC launches the timeline can lag the Python constructor,
+        leaving Articulation.root_physx_view unset when init_buffers() resolves
+        joints. Training usually initializes synchronously, but this guard keeps
+        both paths deterministic.
+        """
+        missing = self._uninitialized_scene_entities()
+        for attempt in range(max_attempts):
+            physics_ready = self._ensure_physics_sim_view()
+            if not missing:
+                return
+            if physics_ready and attempt > 0:
+                for _, entity in missing:
+                    init_callback = getattr(entity, "_initialize_callback", None)
+                    if init_callback is not None and not bool(getattr(entity, "is_initialized", False)):
+                        init_callback(None)
+            try:
+                if physics_ready:
+                    self.sim.forward()
+                self.sim.render()
+            except Exception:
+                pass
+            missing = self._uninitialized_scene_entities()
+
+        names = ", ".join(name for name, _ in missing)
+        raise RuntimeError(
+            "Scene entities were not initialized after SimulationContext.reset(): "
+            f"{names}. This usually means PhysX did not create the expected simulation views."
+        )
 
     def init_buffers(self):
         self.extras = {}
@@ -331,7 +406,9 @@ class TTEnv(VecEnv):
         self.ball_reset_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.stage1_prev_root_z = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         self.stage1_prev_flat_l2 = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.stage1_prev_gravity_x = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         self.stage1_bad_posture_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.stage1_bad_posture_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         # will store env ids that had their ball reset in the most recent step
         self.ball_reset_ids = torch.empty(0, dtype=torch.long, device=self.device)
         self.reset_ball_state_buf = torch.zeros(self.num_envs, 13, device=self.device, dtype=torch.float)
@@ -696,6 +773,34 @@ class TTEnv(VecEnv):
             target_xy[:, 1] = low + (high - low) * torch.rand(len(env_ids), device=self.device)
         self.fixed_target_xy[env_ids] = target_xy
 
+    def _reset_runtime_step_state(self, env_ids: torch.Tensor) -> None:
+        if len(env_ids) == 0:
+            return
+
+        with torch.no_grad():
+            for name in ("last_clipped_actions", "last_gated_actions", "last_target_delta"):
+                value = getattr(self, name, None)
+                if isinstance(value, torch.Tensor):
+                    value[env_ids] = 0.0
+
+            self.ball_pos[env_ids] = self.ball.data.root_pos_w[env_ids] - self.scene.env_origins[env_ids]
+            self.robot_pos[env_ids] = (
+                self.robot.data.root_link_pos_w[env_ids] - self.table.data.root_link_pos_w[env_ids]
+            )
+            self.current_perception[env_ids] = torch.cat([self.ball_pos[env_ids], self.robot_pos[env_ids]], dim=-1)
+            self.delayed_perception[env_ids] = self.current_perception[env_ids]
+
+            action_gate = getattr(self, "last_action_gate", None)
+            if isinstance(action_gate, torch.Tensor):
+                gate = self._stage1_action_health_gate()
+                if isinstance(gate, torch.Tensor):
+                    action_gate[env_ids] = gate[env_ids]
+                else:
+                    action_gate[env_ids] = float(gate)
+
+            joint_targets = self.robot.data.joint_pos[env_ids][:, self.action_joint_ids].clone()
+            self.robot.set_joint_position_target(joint_targets, self.action_joint_ids, env_ids=env_ids)
+
     def reset(self, env_ids):
         if len(env_ids) == 0:
             return
@@ -731,12 +836,15 @@ class TTEnv(VecEnv):
         self.ball_reset_counter[env_ids] = 0
         if hasattr(self, "stage1_bad_posture_steps"):
             self.stage1_bad_posture_steps[env_ids] = 0
+        if hasattr(self, "stage1_bad_posture_mask"):
+            self.stage1_bad_posture_mask[env_ids] = False
 
         # Reset ball state
         self.reset_ball(env_ids)
 
         self.scene.write_data_to_sim()
         self.sim.forward()
+        self._reset_runtime_step_state(env_ids)
         self._sync_stage1_recovery_buffers(env_ids)
 
     def _log_reset_causes(self, env_ids: torch.Tensor) -> None:
@@ -807,6 +915,21 @@ class TTEnv(VecEnv):
             self.extras["log"]["Episode_State/gravity_y_abs_mean"] = gravity_xy[:, 1].abs().mean()
             self.extras["log"]["Episode_State/gravity_y_abs_max"] = gravity_xy[:, 1].abs().max()
 
+        if hasattr(self, "stage1_bad_posture_mask"):
+            bad_mask = self.stage1_bad_posture_mask
+            self.extras["log"]["Episode_State/bad_posture_fraction"] = bad_mask.float().mean()
+            if hasattr(self, "stage1_bad_posture_steps"):
+                bad_steps = self.stage1_bad_posture_steps.float()
+                self.extras["log"]["Episode_State/bad_posture_steps_mean"] = bad_steps.mean()
+                self.extras["log"]["Episode_State/bad_posture_steps_max"] = bad_steps.max()
+            if hasattr(self, "last_clipped_actions"):
+                action_l2 = torch.sum(torch.square(self.last_clipped_actions.float()), dim=1)
+                self.extras["log"]["Episode_State/action_l2_mean"] = action_l2.mean()
+                if bool(bad_mask.any()):
+                    self.extras["log"]["Episode_State/bad_posture_action_l2_mean"] = action_l2[bad_mask].mean()
+                else:
+                    self.extras["log"]["Episode_State/bad_posture_action_l2_mean"] = torch.zeros((), device=self.device)
+
         if getattr(self.cfg.robot, "use_fixed_target_xy_obs", False):
             target_xy = self._get_fixed_target_xy(self.robot_pos)
         else:
@@ -814,23 +937,92 @@ class TTEnv(VecEnv):
         xy_error = torch.linalg.norm(self.robot_pos[:, :2] - target_xy, dim=1)
         self.extras["log"]["Episode_State/xy_error_mean"] = xy_error.float().mean()
         self.extras["log"]["Episode_State/xy_error_max"] = xy_error.float().max()
+        self._log_stage1_actuator_state()
 
-    def _current_stage1_recovery_state(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _log_stage1_actuator_state(self) -> None:
+        if not hasattr(self.robot.data, "applied_torque"):
+            return
+        if not hasattr(self, "action_joint_names"):
+            return
+
+        torque = self.robot.data.applied_torque.float()
+        effort_limits = self._a3_reference_effort_limits().clamp_min(1e-6)
+        groups = {
+            "waist": ["waist_"],
+            "hip": ["hip_"],
+            "knee": ["knee_joint"],
+            "ankle_pitch": ["ankle_pitch_joint"],
+            "ankle_roll": ["ankle_roll_joint"],
+        }
+        for group_name, patterns in groups.items():
+            joint_ids = [
+                joint_id
+                for joint_id, joint_name in enumerate(self.robot.joint_names)
+                if any(pattern in joint_name for pattern in patterns)
+            ]
+            if not joint_ids:
+                continue
+            ids = torch.tensor(joint_ids, dtype=torch.long, device=self.device)
+            abs_torque = torch.abs(torque[:, ids])
+            effort_fraction = abs_torque / effort_limits[:, ids]
+            self.extras["log"][f"Episode_Actuator/{group_name}_torque_abs_mean"] = abs_torque.mean()
+            self.extras["log"][f"Episode_Actuator/{group_name}_torque_abs_max"] = abs_torque.max()
+            self.extras["log"][f"Episode_Actuator/{group_name}_effort_frac_mean"] = effort_fraction.mean()
+            self.extras["log"][f"Episode_Actuator/{group_name}_effort_frac_max"] = effort_fraction.max()
+            if hasattr(self, "stage1_bad_posture_mask"):
+                bad_mask = self.stage1_bad_posture_mask
+                if bool(bad_mask.any()):
+                    self.extras["log"][f"Episode_Actuator/{group_name}_bad_effort_frac_mean"] = effort_fraction[
+                        bad_mask
+                    ].mean()
+                else:
+                    self.extras["log"][f"Episode_Actuator/{group_name}_bad_effort_frac_mean"] = torch.zeros(
+                        (), device=self.device
+                    )
+
+    def _a3_reference_effort_limits(self) -> torch.Tensor:
+        limits = torch.full_like(self.robot.data.applied_torque.float(), 1.0e9)
+        for joint_id, joint_name in enumerate(self.robot.joint_names):
+            if "waist_yaw_joint" in joint_name:
+                limit = 220.0
+            elif "waist_roll_joint" in joint_name:
+                limit = 46.0
+            elif "waist_pitch_joint" in joint_name:
+                limit = 115.0
+            elif "hip_" in joint_name:
+                limit = 220.0
+            elif "knee_joint" in joint_name:
+                limit = 320.0
+            elif "ankle_pitch_joint" in joint_name:
+                limit = 118.2
+            elif "ankle_roll_joint" in joint_name:
+                limit = 54.75
+            else:
+                continue
+            limits[:, joint_id] = limit
+        return limits
+
+    def _current_stage1_recovery_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         root_z = self.robot.data.root_link_pos_w[:, 2] - self.table.data.root_link_pos_w[:, 2]
-        flat_l2 = torch.sum(torch.square(self.robot.data.projected_gravity_b[:, :2]), dim=1)
-        return root_z, flat_l2
+        gravity_xy = self.robot.data.projected_gravity_b[:, :2]
+        flat_l2 = torch.sum(torch.square(gravity_xy), dim=1)
+        return root_z, flat_l2, gravity_xy[:, 0]
 
     def _sync_stage1_recovery_buffers(self, env_ids: torch.Tensor | None = None) -> None:
         if not hasattr(self, "stage1_prev_root_z") or not hasattr(self, "stage1_prev_flat_l2"):
             return
         with torch.no_grad():
-            root_z, flat_l2 = self._current_stage1_recovery_state()
+            root_z, flat_l2, gravity_x = self._current_stage1_recovery_state()
             if env_ids is None:
                 self.stage1_prev_root_z[:] = root_z
                 self.stage1_prev_flat_l2[:] = flat_l2
+                if hasattr(self, "stage1_prev_gravity_x"):
+                    self.stage1_prev_gravity_x[:] = gravity_x
             elif len(env_ids) > 0:
                 self.stage1_prev_root_z[env_ids] = root_z[env_ids]
                 self.stage1_prev_flat_l2[env_ids] = flat_l2[env_ids]
+                if hasattr(self, "stage1_prev_gravity_x"):
+                    self.stage1_prev_gravity_x[env_ids] = gravity_x[env_ids]
 
     def _stage1_recovery_observation(
         self, robot_pos: torch.Tensor, projected_gravity: torch.Tensor
@@ -952,12 +1144,42 @@ class TTEnv(VecEnv):
         self.robot.data.default_joint_pos[:] = default_joint_pos
         self.robot.data.default_joint_vel[:] = 0.0
 
+    def _stage1_action_health_gate(self) -> torch.Tensor | float:
+        if not bool(getattr(self.cfg.robot, "action_health_gate_enable", False)):
+            return 1.0
+
+        if hasattr(self, "robot_pos"):
+            root_z = self.robot_pos[:, 2]
+        else:
+            root_z = self.robot.data.root_pos_w[:, 2] - self.scene.env_origins[:, 2]
+        target_z = float(getattr(self.cfg.robot, "action_health_gate_target_z", 0.955))
+        height_band = max(float(getattr(self.cfg.robot, "action_health_gate_height_band", 0.060)), 1.0e-6)
+        height_gate = torch.clamp((target_z - root_z) / height_band, min=0.0, max=1.0)
+
+        flat_l2 = torch.sum(torch.square(self.robot.data.projected_gravity_b[:, :2]), dim=1)
+        flat_deadband = float(getattr(self.cfg.robot, "action_health_gate_flat_l2_deadband", 0.060))
+        flat_band = max(float(getattr(self.cfg.robot, "action_health_gate_flat_l2_band", 0.100)), 1.0e-6)
+        flat_gate = torch.clamp((flat_l2 - flat_deadband) / flat_band, min=0.0, max=1.0)
+
+        min_scale = float(getattr(self.cfg.robot, "action_health_gate_min_scale", 0.0))
+        gate = torch.clamp(height_gate + flat_gate, min=min_scale, max=1.0)
+        return gate.unsqueeze(1)
+
     def step(self, actions: torch.Tensor):
 
         delayed_actions = self.action_buffer.compute(actions)
 
         cliped_actions = torch.clip(delayed_actions, -self.clip_actions, self.clip_actions).to(self.device)
-        processed_actions = cliped_actions * self.action_scale + self.robot.data.default_joint_pos[:, self.action_joint_ids]
+        self.last_clipped_actions = cliped_actions
+        action_gate = self._stage1_action_health_gate()
+        if isinstance(action_gate, torch.Tensor):
+            self.last_action_gate = action_gate
+        else:
+            self.last_action_gate = torch.ones(self.num_envs, 1, dtype=torch.float, device=self.device)
+        gated_actions = cliped_actions * action_gate
+        self.last_gated_actions = gated_actions
+        self.last_target_delta = gated_actions * self.action_scale
+        processed_actions = self.last_target_delta + self.robot.data.default_joint_pos[:, self.action_joint_ids]
 
         for _ in range(self.cfg.sim.decimation):
             self.sim_step_counter += 1
@@ -1046,19 +1268,21 @@ class TTEnv(VecEnv):
             self.flat_orientation_l2_buf = flat_orientation
             self.reset_flat_orientation_buf = flat_orientation > max_flat_orientation
         bad_posture_steps = int(getattr(self.cfg.robot, "stage1_bad_posture_max_steps", 0))
-        if bad_posture_steps > 0:
-            bad_posture = torch.zeros_like(self.reset_low_z_buf)
-            bad_min_z = float(getattr(self.cfg.robot, "stage1_bad_posture_min_base_z", 0.0))
-            bad_max_flat = float(getattr(self.cfg.robot, "stage1_bad_posture_max_flat_orientation_l2", 0.0))
-            if bad_min_z > 0.0:
-                bad_posture |= self.robot_pos[..., 2] < bad_min_z
-            if bad_max_flat > 0.0:
-                bad_posture |= self.flat_orientation_l2_buf > bad_max_flat
+        bad_posture = torch.zeros_like(self.reset_low_z_buf)
+        bad_min_z = float(getattr(self.cfg.robot, "stage1_bad_posture_min_base_z", 0.0))
+        bad_max_flat = float(getattr(self.cfg.robot, "stage1_bad_posture_max_flat_orientation_l2", 0.0))
+        if bad_min_z > 0.0:
+            bad_posture |= self.robot_pos[..., 2] < bad_min_z
+        if bad_max_flat > 0.0:
+            bad_posture |= self.flat_orientation_l2_buf > bad_max_flat
+        self.stage1_bad_posture_mask = bad_posture
+        if hasattr(self, "stage1_bad_posture_steps"):
             self.stage1_bad_posture_steps = torch.where(
                 bad_posture,
                 self.stage1_bad_posture_steps + 1,
                 torch.zeros_like(self.stage1_bad_posture_steps),
             )
+        if bad_posture_steps > 0:
             self.reset_bad_posture_duration_buf = self.stage1_bad_posture_steps >= bad_posture_steps
         else:
             self.reset_bad_posture_duration_buf = torch.zeros_like(self.reset_low_z_buf)

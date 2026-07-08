@@ -17,7 +17,10 @@ import numpy as np
 import torch
 from isaaclab.app import AppLauncher
 # Use the Isaac Lab adapter for RSL-RL to match the env API
-from rsl_rl.rsl_rl.runners import OnPolicyRunner
+try:
+    from rsl_rl.runners import OnPolicyRunner
+except ModuleNotFoundError:
+    from rsl_rl.rsl_rl.runners import OnPolicyRunner
 # from isaaclab_rl.rsl_rl import OnPolicyRunner
 
 from legged_lab.utils import task_registry
@@ -109,6 +112,11 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+_REQUESTED_LIVESTREAM_MODE = int(getattr(args_cli, "livestream", 0) or 0)
+_REQUESTED_HEADLESS = bool(getattr(args_cli, "headless", False))
+if _REQUESTED_LIVESTREAM_MODE > 0 and not bool(getattr(args_cli, "enable_cameras", False)):
+    args_cli.enable_cameras = True
+    print("[INFO] Livestream requested: enabling Isaac Lab camera/render pipeline.", flush=True)
 
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
@@ -167,7 +175,9 @@ def play():
     # agent_cfg.load_run = "2025-08-23_00-53-24"
     # agent_cfg.load_checkpoint = "model_12000.pt"
 
-    env_cfg.noise.add_noise = True
+    # Play/visualization should show the learned behavior without training-time
+    # observation noise. Training configs are untouched.
+    env_cfg.noise.add_noise = False
     env_cfg.domain_rand.events.push_robot = None
     #env_cfg.scene.max_episode_length_s = 40.0
     env_cfg.scene.num_envs = 50
@@ -192,15 +202,22 @@ def play():
     agent_cfg = update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.seed = agent_cfg.seed
 
-    livestream_mode = int(getattr(args_cli, "livestream", 0) or 0)
-    env_headless = bool(args_cli.headless)
-    if livestream_mode > 0:
-        env_headless = False
+    livestream_mode = _REQUESTED_LIVESTREAM_MODE
+    # Isaac App should still be launched headless for WebRTC, but the task env
+    # must keep its visualization path active so viewport frames are produced.
+    env_headless = bool(_REQUESTED_HEADLESS and livestream_mode <= 0)
     env_class = task_registry.get_task_class(env_class_name)
+    print(
+        f"[INFO] Creating env: task={env_class_name}, num_envs={env_cfg.scene.num_envs}, "
+        f"args_headless={args_cli.headless}, env_headless={env_headless}, livestream={livestream_mode}",
+        flush=True,
+    )
     env = env_class(env_cfg, env_headless)
+    print("[INFO] Environment created successfully.", flush=True)
     print(
         f"[INFO] Play render mode: args_headless={args_cli.headless}, "
-        f"env_headless={env_headless}, livestream={livestream_mode}"
+        f"env_headless={env_headless}, livestream={livestream_mode}",
+        flush=True,
     )
     visualize_mode = (not args_cli.headless) or livestream_mode > 0
     visualize_sleep = args_cli.visualize_sleep
@@ -239,7 +256,10 @@ def play():
 
         # Choose runner implementation
         if args_cli.predictor:
-            from rsl_rl.rsl_rl.runners import OnPolicyPredictorRegressionRunner
+            try:
+                from rsl_rl.runners import OnPolicyPredictorRegressionRunner
+            except ModuleNotFoundError:
+                from rsl_rl.rsl_rl.runners import OnPolicyPredictorRegressionRunner
             runner = OnPolicyPredictorRegressionRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
         else:
             runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
@@ -375,6 +395,8 @@ def play():
                 except Exception:
                     pass
                 step_count += 1
+                if step_count == 1:
+                    print("[INFO] Play loop started.", flush=True)
                 if args_cli.max_play_steps > 0 and step_count >= args_cli.max_play_steps:
                     print(f"[INFO] Reached max_play_steps={args_cli.max_play_steps}.")
                     break

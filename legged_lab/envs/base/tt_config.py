@@ -87,6 +87,12 @@ class RobotCfg:
     stage1_bad_posture_min_base_z: float = 0.0
     stage1_bad_posture_max_flat_orientation_l2: float = 0.0
     stage1_bad_posture_max_steps: int = 0
+    action_health_gate_enable: bool = False
+    action_health_gate_target_z: float = 0.955
+    action_health_gate_height_band: float = 0.060
+    action_health_gate_flat_l2_deadband: float = 0.060
+    action_health_gate_flat_l2_band: float = 0.100
+    action_health_gate_min_scale: float = 0.0
 
 @configclass
 class BallCfg:

@@ -72,6 +72,52 @@ def energy(env: BaseEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) ->
     return reward
 
 
+def _a3_reference_effort_limit(joint_name: str) -> float | None:
+    if "waist_yaw_joint" in joint_name:
+        return 220.0
+    if "waist_roll_joint" in joint_name:
+        return 46.0
+    if "waist_pitch_joint" in joint_name:
+        return 115.0
+    if "hip_" in joint_name:
+        return 220.0
+    if "knee_joint" in joint_name:
+        return 320.0
+    if "ankle_pitch_joint" in joint_name:
+        return 118.2
+    if "ankle_roll_joint" in joint_name:
+        return 54.75
+    return None
+
+
+def penalty_a3_joint_effort_saturation(
+    env: BaseEnv,
+    threshold: float = 0.75,
+    std: float = 0.15,
+    max_penalty: float = 4.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if not hasattr(asset.data, "applied_torque"):
+        return torch.zeros(asset.num_instances, device=env.device)
+
+    joint_ids = torch.as_tensor(asset_cfg.joint_ids, dtype=torch.long, device=env.device)
+    if joint_ids.numel() == 0:
+        return torch.zeros(asset.data.applied_torque.shape[0], device=env.device)
+
+    limits = []
+    for joint_id in joint_ids.detach().cpu().tolist():
+        limit = _a3_reference_effort_limit(asset.joint_names[joint_id])
+        limits.append(1.0e9 if limit is None else limit)
+    limit_tensor = torch.tensor(limits, dtype=asset.data.applied_torque.dtype, device=env.device).clamp_min(1e-6)
+
+    effort_fraction = torch.abs(asset.data.applied_torque[:, joint_ids].float()) / limit_tensor.unsqueeze(0)
+    excess = torch.clamp(effort_fraction - threshold, min=0.0)
+    penalty = torch.mean(excess.square() / (std * std + 1e-12), dim=1)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
 def joint_acc_l2(env: BaseEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.joint_acc[:, asset_cfg.joint_ids]), dim=1)
@@ -102,9 +148,19 @@ def penalty_action_l2_healthy_gated(
     y_margin: float = 0.040,
     xy_std: float = 0.120,
     min_gate: float = 0.05,
+    target_delta_ref: float = 0.050,
+    max_penalty: float = 8.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    action_penalty = action_l2(env)
+    actions = getattr(env, "last_clipped_actions", env.action_buffer._circular_buffer.buffer[:, -1, :])
+    action_scale = getattr(env, "action_scale", 1.0)
+    if isinstance(action_scale, torch.Tensor):
+        target_delta = actions * action_scale
+    else:
+        target_delta = actions * float(action_scale)
+    ref = max(float(target_delta_ref), 1.0e-6)
+    action_penalty = torch.sum(torch.square(target_delta / ref), dim=1)
+    action_penalty = torch.clamp(action_penalty, max=max_penalty)
     asset: Articulation = env.scene[asset_cfg.name]
     if hasattr(env, "robot_pos"):
         root_z = env.robot_pos[:, 2]
@@ -126,6 +182,46 @@ def penalty_action_l2_healthy_gated(
     healthy_gate = torch.clamp(z_gate * flat_gate * xy_gate, min=0.0, max=1.0)
     gate = min_gate + (1.0 - min_gate) * healthy_gate
     return torch.nan_to_num(action_penalty * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def penalty_target_delta_l2(
+    env: BaseEnv,
+    target_delta_ref: float = 0.040,
+    max_penalty: float = 12.0,
+) -> torch.Tensor:
+    target_delta = getattr(env, "last_target_delta", None)
+    if not isinstance(target_delta, torch.Tensor):
+        actions = getattr(env, "last_gated_actions", env.action_buffer._circular_buffer.buffer[:, -1, :])
+        action_scale = getattr(env, "action_scale", 1.0)
+        target_delta = actions * action_scale if isinstance(action_scale, torch.Tensor) else actions * float(action_scale)
+    ref = max(float(target_delta_ref), 1.0e-6)
+    penalty = torch.sum(torch.square(target_delta.float() / ref), dim=1)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def penalty_knee_flexion_target_bias(
+    env: BaseEnv,
+    deadband: float = 0.004,
+    target_delta_ref: float = 0.030,
+    max_penalty: float = 4.0,
+) -> torch.Tensor:
+    target_delta = getattr(env, "last_target_delta", None)
+    if not isinstance(target_delta, torch.Tensor):
+        actions = getattr(env, "last_gated_actions", env.action_buffer._circular_buffer.buffer[:, -1, :])
+        action_scale = getattr(env, "action_scale", 1.0)
+        target_delta = actions * action_scale if isinstance(action_scale, torch.Tensor) else actions * float(action_scale)
+
+    action_names = getattr(env, "action_joint_names", [])
+    knee_ids = [idx for idx, name in enumerate(action_names) if "knee_joint" in name]
+    if not knee_ids:
+        return torch.zeros(target_delta.shape[0], dtype=target_delta.dtype, device=target_delta.device)
+
+    knee_flexion_delta = torch.relu(target_delta[:, knee_ids].float() - float(deadband))
+    ref = max(float(target_delta_ref), 1.0e-6)
+    penalty = torch.mean(torch.square(knee_flexion_delta / ref), dim=1)
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
 
 
 def undesired_contacts(env: BaseEnv, threshold: float, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -313,6 +409,368 @@ def reward_upright_recovery_rate(
     return torch.nan_to_num(rate, nan=0.0, posinf=max_rate, neginf=-max_rate)
 
 
+def reward_stage1_soft_recovery(
+    env: BaseEnv,
+    target_z: float = 1.000,
+    recover_below_z: float = 0.965,
+    max_flat_l2: float = 0.095,
+    max_forward_gravity_x: float = 0.115,
+    height_std: float = 0.060,
+    flat_std: float = 0.060,
+    forward_std: float = 0.060,
+    max_rate: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+
+    gravity_xy = asset.data.projected_gravity_b[:, :2]
+    flat_l2 = torch.sum(torch.square(gravity_xy), dim=1)
+    forward_gravity_x = torch.clamp(gravity_xy[:, 0], min=0.0)
+
+    prev_root_z = getattr(env, "stage1_prev_root_z", root_z).to(device=root_z.device, dtype=root_z.dtype)
+    prev_flat_l2 = getattr(env, "stage1_prev_flat_l2", flat_l2).to(device=flat_l2.device, dtype=flat_l2.dtype)
+
+    current_height_error = torch.clamp(target_z - root_z, min=0.0)
+    prev_height_error = torch.clamp(target_z - prev_root_z, min=0.0)
+    height_recovery = (prev_height_error - current_height_error) / (height_std + 1e-12)
+
+    current_flat_error = torch.clamp(flat_l2 - max_flat_l2, min=0.0)
+    prev_flat_error = torch.clamp(prev_flat_l2 - max_flat_l2, min=0.0)
+    flat_recovery = (prev_flat_error - current_flat_error) / (flat_std + 1e-12)
+
+    forward_error = torch.clamp(forward_gravity_x - max_forward_gravity_x, min=0.0)
+    forward_score = torch.exp(-forward_error.square() / (forward_std * forward_std + 1e-12))
+
+    recovery_zone = (root_z < recover_below_z) | (flat_l2 > max_flat_l2) | (forward_gravity_x > max_forward_gravity_x)
+    recovery = torch.clamp(height_recovery + flat_recovery, min=0.0, max=max_rate)
+    reward = recovery * forward_score * recovery_zone.float()
+    return torch.nan_to_num(reward, nan=0.0, posinf=max_rate, neginf=0.0)
+
+
+def reward_stage1_recovery_posture_score(
+    env: BaseEnv,
+    target_z: float = 1.000,
+    recover_below_z: float = 0.980,
+    max_flat_l2: float = 0.090,
+    max_forward_gravity_x: float = 0.105,
+    height_std: float = 0.085,
+    flat_std: float = 0.075,
+    forward_std: float = 0.075,
+    min_root_z: float = 0.850,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+
+    gravity_xy = asset.data.projected_gravity_b[:, :2]
+    flat_l2 = torch.sum(torch.square(gravity_xy), dim=1)
+    forward_gravity_x = torch.clamp(gravity_xy[:, 0], min=0.0)
+
+    height_deficit = torch.clamp(target_z - root_z, min=0.0)
+    flat_excess = torch.clamp(flat_l2 - max_flat_l2, min=0.0)
+    forward_excess = torch.clamp(forward_gravity_x - max_forward_gravity_x, min=0.0)
+
+    height_score = torch.exp(-height_deficit.square() / (height_std * height_std + 1e-12))
+    flat_score = torch.exp(-flat_excess.square() / (flat_std * flat_std + 1e-12))
+    forward_score = torch.exp(-forward_excess.square() / (forward_std * forward_std + 1e-12))
+    alive_gate = torch.clamp((root_z - min_root_z) / max(recover_below_z - min_root_z, 1e-6), min=0.0, max=1.0)
+    recovery_zone = (root_z < recover_below_z) | (flat_l2 > max_flat_l2) | (forward_gravity_x > max_forward_gravity_x)
+    reward = height_score * flat_score * forward_score * alive_gate * recovery_zone.float()
+    return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_stage1_result_bound_recovery(
+    env: BaseEnv,
+    target_z: float = 0.985,
+    recover_below_z: float = 0.965,
+    healthy_min_z: float = 0.950,
+    max_flat_l2: float = 0.095,
+    healthy_flat_l2: float = 0.085,
+    max_abs_gravity_x: float = 0.115,
+    healthy_abs_gravity_x: float = 0.095,
+    height_std: float = 0.045,
+    flat_std: float = 0.045,
+    pitch_std: float = 0.050,
+    min_root_z: float = 0.885,
+    posture_progress_min_z: float = 0.925,
+    min_height_progress: float = 0.0015,
+    healthy_bonus: float = 0.50,
+    max_reward: float = 2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+
+    gravity_xy = asset.data.projected_gravity_b[:, :2]
+    flat_l2 = torch.sum(torch.square(gravity_xy), dim=1)
+    abs_gravity_x = torch.abs(gravity_xy[:, 0])
+    prev_root_z = getattr(env, "stage1_prev_root_z", root_z).to(device=root_z.device, dtype=root_z.dtype)
+    prev_flat_l2 = getattr(env, "stage1_prev_flat_l2", flat_l2).to(device=flat_l2.device, dtype=flat_l2.dtype)
+
+    height_error = torch.clamp(target_z - root_z, min=0.0)
+    prev_height_error = torch.clamp(target_z - prev_root_z, min=0.0)
+    height_progress = torch.clamp((prev_height_error - height_error) / (height_std + 1e-12), min=0.0, max=1.0)
+    height_improved = (root_z - prev_root_z) > min_height_progress
+
+    flat_error = torch.clamp(flat_l2 - max_flat_l2, min=0.0)
+    prev_flat_error = torch.clamp(prev_flat_l2 - max_flat_l2, min=0.0)
+    flat_progress = torch.clamp((prev_flat_error - flat_error) / (flat_std + 1e-12), min=0.0, max=1.0)
+
+    prev_gravity_x = torch.abs(getattr(env, "stage1_prev_gravity_x", gravity_xy[:, 0]))
+    prev_gravity_x = prev_gravity_x.to(device=abs_gravity_x.device, dtype=abs_gravity_x.dtype)
+    pitch_error = torch.clamp(abs_gravity_x - max_abs_gravity_x, min=0.0)
+    prev_pitch_error = torch.clamp(prev_gravity_x - max_abs_gravity_x, min=0.0)
+    pitch_progress = torch.clamp((prev_pitch_error - pitch_error) / (pitch_std + 1e-12), min=0.0, max=1.0)
+
+    prev_recovery_zone = (
+        (prev_root_z < recover_below_z)
+        | (prev_flat_l2 > max_flat_l2)
+        | (prev_gravity_x > max_abs_gravity_x)
+    )
+    recovery_zone = (root_z < recover_below_z) | (flat_l2 > max_flat_l2) | (abs_gravity_x > max_abs_gravity_x)
+    alive_gate = torch.clamp((root_z - min_root_z) / max(healthy_min_z - min_root_z, 1e-6), min=0.0, max=1.0)
+    posture_progress_gate = ((root_z >= posture_progress_min_z) & height_improved).float()
+    progress_reward = 0.80 * height_progress + posture_progress_gate * (0.12 * flat_progress + 0.08 * pitch_progress)
+
+    healthy = (root_z >= healthy_min_z) & (flat_l2 <= healthy_flat_l2) & (abs_gravity_x <= healthy_abs_gravity_x)
+    recovered_to_healthy = healthy & prev_recovery_zone
+    reward = recovery_zone.float() * alive_gate * progress_reward + recovered_to_healthy.float() * healthy_bonus
+    reward = torch.clamp(reward, min=0.0, max=max_reward)
+    return torch.nan_to_num(reward, nan=0.0, posinf=max_reward, neginf=0.0)
+
+
+def penalty_stage1_passive_low_posture(
+    env: BaseEnv,
+    recover_below_z: float = 0.940,
+    min_root_z: float = 0.830,
+    min_height_progress: float = 0.0015,
+    min_hip_knee_action_l1: float = 0.18,
+    max_penalty: float = 3.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    prev_root_z = getattr(env, "stage1_prev_root_z", root_z).to(device=root_z.device, dtype=root_z.dtype)
+
+    if hasattr(env, "last_clipped_actions"):
+        actions = env.last_clipped_actions.float()
+    else:
+        actions = env.action_buffer._circular_buffer.buffer[:, -1, :].float()
+
+    action_names = getattr(env, "action_joint_names", [])
+    hip_knee_ids = [
+        idx for idx, name in enumerate(action_names) if "hip_pitch_joint" in name or "knee_joint" in name
+    ]
+    if hip_knee_ids:
+        hip_knee_action = torch.mean(torch.abs(actions[:, hip_knee_ids]), dim=1)
+    else:
+        hip_knee_action = torch.mean(torch.abs(actions), dim=1)
+
+    height_progress = root_z - prev_root_z
+    low_gate = torch.clamp((recover_below_z - root_z) / max(recover_below_z - min_root_z, 1e-6), min=0.0, max=1.0)
+    passive_gate = torch.clamp(
+        (min_hip_knee_action_l1 - hip_knee_action) / max(min_hip_knee_action_l1, 1e-6),
+        min=0.0,
+        max=1.0,
+    )
+    no_height_progress = (height_progress < min_height_progress).float()
+    penalty = low_gate * passive_gate * no_height_progress
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def reward_stage1_low_height_lift_rate(
+    env: BaseEnv,
+    min_z: float = 0.880,
+    healthy_z: float = 0.950,
+    min_up_rate: float = 0.015,
+    max_up_rate: float = 0.35,
+    max_reward: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    prev_root_z = getattr(env, "stage1_prev_root_z", root_z).to(device=root_z.device, dtype=root_z.dtype)
+    dt = max(float(getattr(env, "step_dt", 1.0)), 1e-6)
+
+    up_rate = (root_z - prev_root_z) / dt
+    recovery_gate = torch.clamp((healthy_z - root_z) / max(healthy_z - min_z, 1e-6), min=0.0, max=1.0)
+    alive_gate = (root_z > min_z).float()
+    lift = torch.clamp((up_rate - min_up_rate) / max(max_up_rate - min_up_rate, 1e-6), min=0.0, max=max_reward)
+    reward = recovery_gate * alive_gate * lift
+    return torch.nan_to_num(reward, nan=0.0, posinf=max_reward, neginf=0.0)
+
+
+def penalty_stage1_low_height_drop_rate(
+    env: BaseEnv,
+    min_z: float = 0.880,
+    healthy_z: float = 0.950,
+    max_safe_down_rate: float = 0.010,
+    max_down_rate: float = 0.35,
+    max_penalty: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    prev_root_z = getattr(env, "stage1_prev_root_z", root_z).to(device=root_z.device, dtype=root_z.dtype)
+    dt = max(float(getattr(env, "step_dt", 1.0)), 1e-6)
+
+    down_rate = (prev_root_z - root_z) / dt
+    recovery_gate = torch.clamp((healthy_z - root_z) / max(healthy_z - min_z, 1e-6), min=0.0, max=1.0)
+    danger_gate = (root_z > min_z).float()
+    drop = torch.clamp(
+        (down_rate - max_safe_down_rate) / max(max_down_rate - max_safe_down_rate, 1e-6),
+        min=0.0,
+        max=max_penalty,
+    )
+    penalty = recovery_gate * danger_gate * drop
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def reward_stage1_low_posture_hip_knee_activity(
+    env: BaseEnv,
+    recover_below_z: float = 0.950,
+    min_root_z: float = 0.830,
+    target_action_l1: float = 0.35,
+    max_reward: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+
+    if hasattr(env, "last_clipped_actions"):
+        actions = env.last_clipped_actions.float()
+    else:
+        actions = env.action_buffer._circular_buffer.buffer[:, -1, :].float()
+
+    action_names = getattr(env, "action_joint_names", [])
+    hip_knee_ids = [
+        idx for idx, name in enumerate(action_names) if "hip_pitch_joint" in name or "knee_joint" in name
+    ]
+    if not hip_knee_ids:
+        return torch.zeros(actions.shape[0], dtype=actions.dtype, device=actions.device)
+
+    hip_knee_action = torch.mean(torch.abs(actions[:, hip_knee_ids]), dim=1)
+    low_gate = torch.clamp((recover_below_z - root_z) / max(recover_below_z - min_root_z, 1e-6), min=0.0, max=1.0)
+    activity = torch.clamp(hip_knee_action / max(target_action_l1, 1e-6), min=0.0, max=max_reward)
+    reward = low_gate * activity
+    return torch.nan_to_num(reward, nan=0.0, posinf=max_reward, neginf=0.0)
+
+
+def penalty_stage1_unproductive_recovery_action(
+    env: BaseEnv,
+    target_z: float = 0.985,
+    recover_below_z: float = 0.965,
+    max_flat_l2: float = 0.095,
+    max_abs_gravity_x: float = 0.115,
+    min_height_progress: float = 0.0015,
+    min_flat_progress: float = 0.0015,
+    min_pitch_progress: float = 0.0015,
+    action_l2_ref: float = 4.0,
+    max_penalty: float = 3.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+
+    gravity_xy = asset.data.projected_gravity_b[:, :2]
+    flat_l2 = torch.sum(torch.square(gravity_xy), dim=1)
+    abs_gravity_x = torch.abs(gravity_xy[:, 0])
+    prev_root_z = getattr(env, "stage1_prev_root_z", root_z).to(device=root_z.device, dtype=root_z.dtype)
+    prev_flat_l2 = getattr(env, "stage1_prev_flat_l2", flat_l2).to(device=flat_l2.device, dtype=flat_l2.dtype)
+    prev_gravity_x = torch.abs(getattr(env, "stage1_prev_gravity_x", gravity_xy[:, 0]))
+    prev_gravity_x = prev_gravity_x.to(device=abs_gravity_x.device, dtype=abs_gravity_x.dtype)
+
+    height_progress = root_z - prev_root_z
+    flat_progress = prev_flat_l2 - flat_l2
+    pitch_progress = prev_gravity_x - abs_gravity_x
+    no_progress = (
+        (height_progress < min_height_progress)
+        & (flat_progress < min_flat_progress)
+        & (pitch_progress < min_pitch_progress)
+    )
+    recovery_zone = (root_z < recover_below_z) | (flat_l2 > max_flat_l2) | (abs_gravity_x > max_abs_gravity_x)
+
+    if hasattr(env, "last_clipped_actions"):
+        actions = env.last_clipped_actions.float()
+    else:
+        actions = env.action_buffer._circular_buffer.buffer[:, -1, :].float()
+    action_level = torch.clamp(torch.sum(torch.square(actions), dim=1) / max(action_l2_ref, 1e-6), min=0.0)
+    penalty = recovery_zone.float() * no_progress.float() * action_level
+    penalty = torch.clamp(penalty, max=max_penalty)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=max_penalty, neginf=0.0)
+
+
+def reward_stage1_hip_knee_recovery_action(
+    env: BaseEnv,
+    target_z: float = 0.985,
+    recover_below_z: float = 0.955,
+    max_forward_gravity_x: float = 0.100,
+    height_scale: float = 0.080,
+    desired_scale: float = 1.20,
+    opposite_scale: float = 1.20,
+    opposite_weight: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+
+    if hasattr(env, "last_clipped_actions"):
+        actions = env.last_clipped_actions.float()
+    else:
+        actions = env.action_buffer._circular_buffer.buffer[:, -1, :].float()
+
+    action_names = getattr(env, "action_joint_names", [])
+    hip_ids = [idx for idx, name in enumerate(action_names) if "hip_pitch_joint" in name]
+    knee_ids = [idx for idx, name in enumerate(action_names) if "knee_joint" in name]
+    if not hip_ids or not knee_ids:
+        return torch.zeros(actions.shape[0], dtype=actions.dtype, device=actions.device)
+
+    hip_pitch_action = actions[:, hip_ids].mean(dim=1)
+    knee_action = actions[:, knee_ids].mean(dim=1)
+
+    desired = torch.relu(hip_pitch_action) + torch.relu(-knee_action)
+    opposite = torch.relu(-hip_pitch_action) + torch.relu(knee_action)
+    desired_score = torch.clamp(desired / max(desired_scale, 1e-6), min=0.0, max=1.0)
+    opposite_score = torch.clamp(opposite / max(opposite_scale, 1e-6), min=0.0, max=1.0)
+
+    forward_gravity_x = torch.clamp(asset.data.projected_gravity_b[:, 0], min=0.0)
+    height_deficit = torch.clamp(target_z - root_z, min=0.0)
+    height_gate = torch.clamp(height_deficit / max(height_scale, 1e-6), min=0.0, max=1.0)
+    recovery_zone = (root_z < recover_below_z) | (forward_gravity_x > max_forward_gravity_x)
+
+    reward = height_gate * recovery_zone.float() * (desired_score - opposite_weight * opposite_score)
+    return torch.nan_to_num(reward, nan=0.0, posinf=1.0, neginf=-opposite_weight)
+
+
 def reward_alive(env: BaseEnv) -> torch.Tensor:
     return (~env.reset_buf).float()
 
@@ -360,6 +818,26 @@ def reward_robot_base_height_target_stability_gated(
 ) -> torch.Tensor:
     reward = reward_robot_base_height_target(env, target_z=target_z, std=std, asset_cfg=asset_cfg)
     gate = a3_stability_gate(env, gate_floor=gate_floor, score_kwargs=score_kwargs)
+    return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_robot_base_height_target_height_gated(
+    env: BaseEnv,
+    target_z: float = 1.04,
+    std: float = 0.08,
+    min_z: float = 0.920,
+    transition: float = 0.030,
+    floor: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    reward = reward_robot_base_height_target(env, target_z=target_z, std=std, asset_cfg=asset_cfg)
+    gate = torch.clamp((root_z - min_z) / (transition + 1e-12), min=0.0, max=1.0)
+    gate = floor + (1.0 - floor) * gate
     return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -455,6 +933,26 @@ def reward_robot_xy_target_stability_gated(
 ) -> torch.Tensor:
     reward = reward_robot_xy_target(env, target_xy=target_xy, std=std, asset_cfg=asset_cfg)
     gate = a3_stability_gate(env, gate_floor=gate_floor, score_kwargs=score_kwargs)
+    return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_robot_xy_target_height_gated(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.30, 0.35),
+    std: float = 0.24,
+    min_z: float = 0.940,
+    transition: float = 0.010,
+    floor: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    reward = reward_robot_xy_target(env, target_xy=target_xy, std=std, asset_cfg=asset_cfg)
+    gate = torch.clamp((root_z - min_z) / (transition + 1e-12), min=0.0, max=1.0)
+    gate = floor + (1.0 - floor) * gate
     return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -642,6 +1140,41 @@ def reward_robot_axis_velocity_towards_target_stability_gated(
         asset_cfg=asset_cfg,
     )
     gate = a3_stability_gate(env, gate_floor=gate_floor, score_kwargs=score_kwargs)
+    return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def reward_robot_axis_velocity_towards_target_height_gated(
+    env: BaseEnv,
+    target_xy: Tuple[float, float] = (-2.25, 0.35),
+    x_margin: float = 0.025,
+    y_margin: float = 0.025,
+    max_x_speed: float = 0.22,
+    max_y_speed: float = 0.18,
+    x_weight: float = 0.70,
+    y_weight: float = 0.30,
+    min_z: float = 0.940,
+    transition: float = 0.010,
+    floor: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(env, "robot_pos"):
+        root_z = env.robot_pos[:, 2]
+    else:
+        root_z = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    reward = reward_robot_axis_velocity_towards_target(
+        env,
+        target_xy=target_xy,
+        x_margin=x_margin,
+        y_margin=y_margin,
+        max_x_speed=max_x_speed,
+        max_y_speed=max_y_speed,
+        x_weight=x_weight,
+        y_weight=y_weight,
+        asset_cfg=asset_cfg,
+    )
+    gate = torch.clamp((root_z - min_z) / (transition + 1e-12), min=0.0, max=1.0)
+    gate = floor + (1.0 - floor) * gate
     return torch.nan_to_num(reward * gate, nan=0.0, posinf=0.0, neginf=0.0)
 
 

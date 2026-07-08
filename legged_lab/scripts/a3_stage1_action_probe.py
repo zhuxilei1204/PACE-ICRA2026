@@ -417,6 +417,49 @@ def _reset_cause(env, name: str) -> torch.Tensor:
     return value
 
 
+def _actuator_group_joint_ids(env) -> dict[str, torch.Tensor]:
+    groups = {
+        "waist": ["waist_"],
+        "hip": ["hip_"],
+        "knee": ["knee_joint"],
+        "ankle_pitch": ["ankle_pitch_joint"],
+        "ankle_roll": ["ankle_roll_joint"],
+    }
+    result: dict[str, torch.Tensor] = {}
+    for group_name, patterns in groups.items():
+        ids = [
+            joint_id
+            for joint_id, joint_name in enumerate(env.robot.joint_names)
+            if any(pattern in joint_name for pattern in patterns)
+        ]
+        if ids:
+            result[group_name] = torch.tensor(ids, dtype=torch.long, device=env.device)
+    return result
+
+
+def _a3_reference_effort_limits(env) -> torch.Tensor:
+    limits = torch.full_like(env.robot.data.applied_torque.float(), 1.0e9)
+    for joint_id, joint_name in enumerate(env.robot.joint_names):
+        if "waist_yaw_joint" in joint_name:
+            limit = 220.0
+        elif "waist_roll_joint" in joint_name:
+            limit = 46.0
+        elif "waist_pitch_joint" in joint_name:
+            limit = 115.0
+        elif "hip_" in joint_name:
+            limit = 220.0
+        elif "knee_joint" in joint_name:
+            limit = 320.0
+        elif "ankle_pitch_joint" in joint_name:
+            limit = 118.2
+        elif "ankle_roll_joint" in joint_name:
+            limit = 54.75
+        else:
+            continue
+        limits[:, joint_id] = limit
+    return limits
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Probe A3 Stage-1 constant action drift.")
     parser.add_argument("--task", type=str, default="a3_tt_stage1_balance_move")
@@ -540,6 +583,23 @@ def main() -> None:
         alive_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         action_l2_sum = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
         action_max_abs = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
+        actuator_group_ids = _actuator_group_joint_ids(env)
+        torque_abs_sum = {
+            name: torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
+            for name in actuator_group_ids
+        }
+        torque_abs_max = {
+            name: torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
+            for name in actuator_group_ids
+        }
+        effort_frac_sum = {
+            name: torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
+            for name in actuator_group_ids
+        }
+        effort_frac_max = {
+            name: torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
+            for name in actuator_group_ids
+        }
         for step in range(1, args.steps + 1):
             with torch.inference_mode():
                 before_flat_l2 = _flat_orientation_l2(env).detach()
@@ -555,6 +615,18 @@ def main() -> None:
                 action_l2_sum += torch.sum(torch.square(step_actions), dim=1)
                 action_max_abs = torch.maximum(action_max_abs, torch.max(torch.abs(step_actions), dim=1).values)
                 _, _, reset_buf, _ = env.step(step_actions)
+                if hasattr(env.robot.data, "applied_torque"):
+                    abs_torque_all = torch.abs(env.robot.data.applied_torque.float())
+                    effort_limits_all = _a3_reference_effort_limits(env).clamp_min(1e-6)
+                    for group_name, joint_ids in actuator_group_ids.items():
+                        abs_torque = abs_torque_all[:, joint_ids]
+                        effort_fraction = abs_torque / effort_limits_all[:, joint_ids]
+                        torque_abs_sum[group_name] += abs_torque.mean(dim=1)
+                        torque_abs_max[group_name] = torch.maximum(torque_abs_max[group_name], abs_torque.max(dim=1).values)
+                        effort_frac_sum[group_name] += effort_fraction.mean(dim=1)
+                        effort_frac_max[group_name] = torch.maximum(
+                            effort_frac_max[group_name], effort_fraction.max(dim=1).values
+                        )
                 if bool(reset_buf.any()) and any(candidate.joint_pos for candidate in candidates):
                     reset_ids = reset_buf.nonzero(as_tuple=False).flatten()
                     _apply_per_env_joint_pos_candidates(env, candidates, reset_ids)
@@ -632,6 +704,11 @@ def main() -> None:
                 "bad_posture_reset_seen": bool(bad_posture_reset_seen[i].detach().cpu()),
                 "timeout_seen": bool(timeout_seen[i].detach().cpu()),
             }
+            for group_name in actuator_group_ids:
+                row[f"{group_name}_torque_abs_mean"] = float(torque_abs_sum[group_name][i] / max(args.steps, 1))
+                row[f"{group_name}_torque_abs_max"] = float(torque_abs_max[group_name][i])
+                row[f"{group_name}_effort_frac_mean"] = float(effort_frac_sum[group_name][i] / max(args.steps, 1))
+                row[f"{group_name}_effort_frac_max"] = float(effort_frac_max[group_name][i])
             rows.append(row)
             if not args.summary_only:
                 print(
