@@ -718,6 +718,7 @@ class TTEnv(VecEnv):
         reward_extras = self.reward_manager.reset(env_ids)
         self.extras["log"].update(reward_extras)
         self._log_reset_causes(env_ids)
+        self._log_stage1_global_state()
         self.extras["time_outs"] = self.time_out_buf
 
         self.command_generator.reset(env_ids)
@@ -741,6 +742,17 @@ class TTEnv(VecEnv):
     def _log_reset_causes(self, env_ids: torch.Tensor) -> None:
         if len(env_ids) == 0:
             return
+        reset_count = float(len(env_ids))
+        self.extras["log"]["Episode_Reset/count"] = torch.tensor(
+            reset_count,
+            dtype=torch.float,
+            device=self.device,
+        )
+        self.extras["log"]["Episode_Reset/fraction"] = torch.tensor(
+            reset_count / max(float(self.num_envs), 1.0),
+            dtype=torch.float,
+            device=self.device,
+        )
         reset_cause_attrs = {
             "Episode_Reset/low_base_z": "reset_low_z_buf",
             "Episode_Reset/x_low": "reset_x_low_buf",
@@ -754,7 +766,9 @@ class TTEnv(VecEnv):
         }
         for log_name, attr_name in reset_cause_attrs.items():
             if hasattr(self, attr_name):
-                self.extras["log"][log_name] = getattr(self, attr_name)[env_ids].float().mean()
+                cause_values = getattr(self, attr_name)[env_ids].float()
+                self.extras["log"][log_name] = cause_values.mean()
+                self.extras["log"][f"{log_name}_fraction"] = cause_values.sum() / max(float(self.num_envs), 1.0)
         if hasattr(self, "robot_pos"):
             reset_root_z = self.robot_pos[env_ids, 2]
             self.extras["log"]["Episode_Reset/root_z_mean"] = reset_root_z.float().mean()
@@ -763,8 +777,43 @@ class TTEnv(VecEnv):
             reset_flat_l2 = self.flat_orientation_l2_buf[env_ids]
             self.extras["log"]["Episode_Reset/flat_l2_mean"] = reset_flat_l2.float().mean()
             self.extras["log"]["Episode_Reset/flat_l2_max"] = reset_flat_l2.float().max()
+        if hasattr(self, "projected_gravity_xy_buf"):
+            reset_gravity_xy = self.projected_gravity_xy_buf[env_ids]
+            reset_gravity_x = reset_gravity_xy[:, 0]
+            reset_gravity_y = reset_gravity_xy[:, 1]
+            self.extras["log"]["Episode_Reset/gravity_x_mean"] = reset_gravity_x.float().mean()
+            self.extras["log"]["Episode_Reset/gravity_x_max"] = reset_gravity_x.float().max()
+            self.extras["log"]["Episode_Reset/gravity_y_abs_mean"] = reset_gravity_y.float().abs().mean()
+            self.extras["log"]["Episode_Reset/gravity_y_abs_max"] = reset_gravity_y.float().abs().max()
         if hasattr(self, "episode_length_buf"):
             self.extras["log"]["Episode_Reset/episode_length_mean"] = self.episode_length_buf[env_ids].float().mean()
+
+    def _log_stage1_global_state(self) -> None:
+        if not hasattr(self, "robot_pos"):
+            return
+        root_z = self.robot_pos[:, 2].float()
+        self.extras["log"]["Episode_State/root_z_mean"] = root_z.mean()
+        self.extras["log"]["Episode_State/root_z_min"] = root_z.min()
+
+        if hasattr(self, "flat_orientation_l2_buf"):
+            flat_l2 = self.flat_orientation_l2_buf.float()
+            self.extras["log"]["Episode_State/flat_l2_mean"] = flat_l2.mean()
+            self.extras["log"]["Episode_State/flat_l2_max"] = flat_l2.max()
+
+        if hasattr(self, "projected_gravity_xy_buf"):
+            gravity_xy = self.projected_gravity_xy_buf.float()
+            self.extras["log"]["Episode_State/gravity_x_mean"] = gravity_xy[:, 0].mean()
+            self.extras["log"]["Episode_State/gravity_x_max_abs"] = gravity_xy[:, 0].abs().max()
+            self.extras["log"]["Episode_State/gravity_y_abs_mean"] = gravity_xy[:, 1].abs().mean()
+            self.extras["log"]["Episode_State/gravity_y_abs_max"] = gravity_xy[:, 1].abs().max()
+
+        if getattr(self.cfg.robot, "use_fixed_target_xy_obs", False):
+            target_xy = self._get_fixed_target_xy(self.robot_pos)
+        else:
+            target_xy = self.robot_pos.new_tensor(self.cfg.robot.future_invalid_robot_xy).expand(self.num_envs, 2)
+        xy_error = torch.linalg.norm(self.robot_pos[:, :2] - target_xy, dim=1)
+        self.extras["log"]["Episode_State/xy_error_mean"] = xy_error.float().mean()
+        self.extras["log"]["Episode_State/xy_error_max"] = xy_error.float().max()
 
     def _current_stage1_recovery_state(self) -> tuple[torch.Tensor, torch.Tensor]:
         root_z = self.robot.data.root_link_pos_w[:, 2] - self.table.data.root_link_pos_w[:, 2]
@@ -987,12 +1036,13 @@ class TTEnv(VecEnv):
         x_min, x_max = self.cfg.robot.termination_robot_x_range
         y_min, y_max = self.cfg.robot.termination_robot_y_range
         self.reset_low_z_buf = self.robot_pos[..., 2] < self.cfg.robot.termination_min_base_z
+        self.projected_gravity_xy_buf = self.robot.data.projected_gravity_b[:, :2].clone()
         max_flat_orientation = self.cfg.robot.termination_max_flat_orientation_l2
         if max_flat_orientation is None or max_flat_orientation <= 0.0:
             self.flat_orientation_l2_buf = torch.zeros_like(self.reset_low_z_buf, dtype=torch.float)
             self.reset_flat_orientation_buf = torch.zeros_like(self.reset_low_z_buf)
         else:
-            flat_orientation = torch.sum(torch.square(self.robot.data.projected_gravity_b[:, :2]), dim=1)
+            flat_orientation = torch.sum(torch.square(self.projected_gravity_xy_buf), dim=1)
             self.flat_orientation_l2_buf = flat_orientation
             self.reset_flat_orientation_buf = flat_orientation > max_flat_orientation
         bad_posture_steps = int(getattr(self.cfg.robot, "stage1_bad_posture_max_steps", 0))

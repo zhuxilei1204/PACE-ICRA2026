@@ -153,3 +153,4 @@ def reset_joints_by_position_map(
     joint_vel = joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
 
     asset.write_joint_state_to_sim(joint_pos_tensor, joint_vel, joint_ids=joint_ids, env_ids=env_ids)
+    asset.set_joint_position_target(joint_pos_tensor, joint_ids=joint_ids, env_ids=env_ids)

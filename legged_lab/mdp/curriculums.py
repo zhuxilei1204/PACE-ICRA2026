@@ -66,6 +66,42 @@ def modify_reward_weight_linear(env: TTEnv, env_ids: Sequence[int], term_name: s
     env.reward_manager.set_term_cfg(term_name, term_cfg)
 
 
+def modify_action_scale_linear(
+    env: TTEnv,
+    env_ids: Sequence[int],
+    start_scale: float,
+    target_scale: float,
+    start_step: int,
+    end_step: int,
+):
+    """Linearly releases the policy residual action scale toward its nominal value."""
+    del env_ids
+
+    nominal_action_scale = getattr(env, "_nominal_action_scale_curriculum", None)
+    if nominal_action_scale is None:
+        if isinstance(env.action_scale, torch.Tensor):
+            nominal_action_scale = env.action_scale.detach().clone()
+        else:
+            nominal_action_scale = float(env.action_scale)
+        env._nominal_action_scale_curriculum = nominal_action_scale
+
+    global_sim_step_counter = env.sim_step_counter // env.cfg.sim.decimation
+    if global_sim_step_counter <= start_step:
+        scale = float(start_scale)
+    elif global_sim_step_counter >= end_step:
+        scale = float(target_scale)
+    else:
+        alpha = (global_sim_step_counter - start_step) / max(end_step - start_step, 1)
+        scale = float(start_scale + (target_scale - start_scale) * alpha)
+
+    if isinstance(nominal_action_scale, torch.Tensor):
+        env.action_scale = nominal_action_scale * scale
+    else:
+        env.action_scale = float(nominal_action_scale) * scale
+
+    return {"action_scale_factor": scale}
+
+
 def modify_ball_ranges_piecewise_linear(env: TTEnv, env_ids: Sequence[int], phases: Sequence[dict], start_step: int = 0):
     """Linearly expands ball serve ranges across a sequence of curriculum phases."""
     if not phases:

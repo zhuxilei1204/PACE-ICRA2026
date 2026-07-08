@@ -173,10 +173,10 @@ A3_STAGE1_UPPER_BODY_JOINT_POS = {
     "right_wrist_pitch_joint": 0.0,
     "right_wrist_yaw_joint": 0.0,
 }
-A3_STAGE1_STAND_ROOT_POS = (-1.6, 0.0, 1.055)
+A3_STAGE1_STAND_ROOT_POS = (-1.6, 0.0, 1.000)
 A3_STAGE1_STAND_INIT_UPPER_BODY_JOINT_POS = {
     **A3_STAGE1_UPPER_BODY_JOINT_POS,
-    "waist_pitch_joint": 0.0,
+    "waist_pitch_joint": 0.04,
 }
 A3_STAGE1_LOWER_BODY_JOINT_POS = {
     "left_hip_pitch_joint": -0.02,
@@ -194,50 +194,22 @@ A3_STAGE1_LOWER_BODY_JOINT_POS = {
 }
 A3_STAGE1_STAND_INIT_LOWER_BODY_JOINT_POS = {
     **A3_STAGE1_LOWER_BODY_JOINT_POS,
-    "left_hip_pitch_joint": 0.0,
-    "left_hip_roll_joint": 0.12,
+    "left_hip_pitch_joint": -0.04,
+    "left_hip_roll_joint": 0.16,
     "left_hip_yaw_joint": 0.0,
-    "left_knee_joint": 0.35,
-    "left_ankle_pitch_joint": -0.14,
-    "left_ankle_roll_joint": -0.054,
-    "right_hip_pitch_joint": 0.0,
-    "right_hip_roll_joint": -0.12,
+    "left_knee_joint": 0.46,
+    "left_ankle_pitch_joint": -0.17,
+    "left_ankle_roll_joint": -0.072,
+    "right_hip_pitch_joint": -0.04,
+    "right_hip_roll_joint": -0.16,
     "right_hip_yaw_joint": 0.0,
-    "right_knee_joint": 0.35,
-    "right_ankle_pitch_joint": -0.14,
-    "right_ankle_roll_joint": 0.054,
+    "right_knee_joint": 0.46,
+    "right_ankle_pitch_joint": -0.17,
+    "right_ankle_roll_joint": 0.072,
 }
-A3_STAGE1_STAND_RESET_LOWER_BODY_JOINT_POS = {
-    **A3_STAGE1_LOWER_BODY_JOINT_POS,
-    "left_hip_pitch_joint": 0.0,
-    "left_hip_roll_joint": 0.12,
-    "left_hip_yaw_joint": 0.0,
-    "left_knee_joint": 0.35,
-    "left_ankle_pitch_joint": -0.14,
-    "left_ankle_roll_joint": -0.054,
-    "right_hip_pitch_joint": 0.0,
-    "right_hip_roll_joint": -0.12,
-    "right_hip_yaw_joint": 0.0,
-    "right_knee_joint": 0.35,
-    "right_ankle_pitch_joint": -0.14,
-    "right_ankle_roll_joint": 0.054,
-}
-A3_STAGE1_STAND_LOWER_BODY_JOINT_POS = {
-    **A3_STAGE1_LOWER_BODY_JOINT_POS,
-    "left_hip_pitch_joint": 0.0,
-    "left_hip_roll_joint": 0.12,
-    "left_hip_yaw_joint": 0.0,
-    "left_knee_joint": 0.35,
-    "left_ankle_pitch_joint": -0.14,
-    "left_ankle_roll_joint": -0.054,
-    "right_hip_pitch_joint": 0.0,
-    "right_hip_roll_joint": -0.12,
-    "right_hip_yaw_joint": 0.0,
-    "right_knee_joint": 0.35,
-    "right_ankle_pitch_joint": -0.14,
-    "right_ankle_roll_joint": 0.054,
-}
-A3_STAGE1_STAND_TARGET_Z = 0.985
+A3_STAGE1_STAND_RESET_LOWER_BODY_JOINT_POS = A3_STAGE1_STAND_INIT_LOWER_BODY_JOINT_POS.copy()
+A3_STAGE1_STAND_LOWER_BODY_JOINT_POS = A3_STAGE1_STAND_INIT_LOWER_BODY_JOINT_POS.copy()
+A3_STAGE1_STAND_TARGET_Z = 0.965
 A3_STAGE1_STAND_RESET_JOINT_POS = {
     **A3_STAGE1_STAND_INIT_UPPER_BODY_JOINT_POS,
     **A3_STAGE1_STAND_RESET_LOWER_BODY_JOINT_POS,
@@ -434,6 +406,15 @@ A3_STAGE1_DAMPING_SCALES = {
     "waist": 1.15,
     "legs": 1.65,
     "feet": 2.15,
+}
+A3_STAGE1_STAND_DAMPING_SCALES = {
+    "waist": 1.15,
+    "legs": 2.475,
+    "feet": 3.225,
+}
+A3_STAGE1_STAND_STIFFNESS_SCALES = {
+    "legs": 1.10,
+    "feet": 1.10,
 }
 A3_STAGE1_ZERO_DELAY_ACTUATOR_GROUPS = {"waist", "legs", "feet"}
 A3_STAGE5F_BALL_ABILITY_PHASES = [
@@ -1092,14 +1073,20 @@ def _scale_a3_stage1_actuator_value(value, scale: float):
     return value
 
 
-def _scale_a3_stage1_actuator_damping(actuators):
+def _scale_a3_stage1_actuator_damping(actuators, damping_scales=None, stiffness_scales=None):
+    damping_scales = A3_STAGE1_DAMPING_SCALES if damping_scales is None else damping_scales
+    stiffness_scales = {} if stiffness_scales is None else stiffness_scales
     scaled = {}
     for name, actuator in actuators.items():
         replace_kwargs = {
             "damping": _scale_a3_stage1_actuator_value(
                 actuator.damping,
-                A3_STAGE1_DAMPING_SCALES.get(name, 1.0),
-            )
+                damping_scales.get(name, 1.0),
+            ),
+            "stiffness": _scale_a3_stage1_actuator_value(
+                actuator.stiffness,
+                stiffness_scales.get(name, 1.0),
+            ),
         }
         if name in A3_STAGE1_ZERO_DELAY_ACTUATOR_GROUPS:
             if hasattr(actuator, "min_delay"):
@@ -1164,7 +1151,11 @@ def _apply_a3_stage1_stand_stance(env_cfg, pose_range):
             pos=A3_STAGE1_STAND_ROOT_POS,
             joint_pos=joint_pos,
         ),
-        actuators=_scale_a3_stage1_actuator_damping(A3_T2D5_PINGPANG_CFG.actuators),
+        actuators=_scale_a3_stage1_actuator_damping(
+            A3_T2D5_PINGPANG_CFG.actuators,
+            A3_STAGE1_STAND_DAMPING_SCALES,
+            A3_STAGE1_STAND_STIFFNESS_SCALES,
+        ),
     )
     env_cfg.domain_rand.events.reset_base.params["pose_range"] = pose_range.copy()
     env_cfg.domain_rand.events.reset_base.params["velocity_range"] = A3_STAGE1_STAND_BASE_VELOCITY_RANGE.copy()
@@ -1347,10 +1338,10 @@ def _a3_stage1_stand_score_kwargs():
             "velocity_weight": 0.02,
             "clean_weight": 0.00,
             "feet_width_weight": 0.02,
-            "min_base_z": 0.945,
-            "max_base_z": 1.040,
-            "height_std": 0.060,
-            "upright_std": 0.120,
+            "min_base_z": 0.950,
+            "max_base_z": 1.045,
+            "height_std": 0.065,
+            "upright_std": 0.135,
             "lin_vel_std": 0.28,
             "ang_vel_std": 0.50,
         }
@@ -1791,12 +1782,12 @@ class A3Stage1StandRewardCfg(A3Stage1BalanceMoveRewardCfg):
     reward_alive = RewTerm(
         func=mdp.reward_alive_height_gated,
         weight=4.0,
-        params={"min_z": 0.950, "transition": 0.050, "floor": 0.0},
+        params={"min_z": 0.930, "transition": 0.060, "floor": 0.0},
     )
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-3000.0)
-    lin_vel_x_l2 = RewTerm(func=mdp.lin_vel_x_l2, weight=-4.0)
-    lin_vel_y_l2 = RewTerm(func=mdp.lin_vel_y_l2, weight=-3.0)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-360.0)
+    lin_vel_x_l2 = RewTerm(func=mdp.lin_vel_x_l2, weight=-8.0)
+    lin_vel_y_l2 = RewTerm(func=mdp.lin_vel_y_l2, weight=-6.0)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-240.0)
     reward_base_height_target = RewTerm(
         func=mdp.reward_robot_base_height_target_stability_gated,
         weight=160.0,
@@ -1809,122 +1800,143 @@ class A3Stage1StandRewardCfg(A3Stage1BalanceMoveRewardCfg):
     )
     penalty_base_height_target = RewTerm(
         func=mdp.penalty_robot_base_height_target_l2,
-        weight=-150.0,
-        params={"target_z": A3_STAGE1_STAND_TARGET_Z, "deadband": 0.015, "std": 0.055, "max_penalty": 8.0},
+        weight=-90.0,
+        params={"target_z": A3_STAGE1_STAND_TARGET_Z, "deadband": 0.025, "std": 0.070, "max_penalty": 6.0},
     )
     reward_base_height_hold = RewTerm(
         func=mdp.reward_robot_base_height_target,
-        weight=360.0,
-        params={"target_z": A3_STAGE1_STAND_TARGET_Z, "std": 0.055},
+        weight=300.0,
+        params={"target_z": A3_STAGE1_STAND_TARGET_Z, "std": 0.070},
     )
     reward_base_height_recovery = RewTerm(
         func=mdp.reward_robot_base_height_target,
-        weight=110.0,
-        params={"target_z": A3_STAGE1_STAND_TARGET_Z, "std": 0.080},
+        weight=90.0,
+        params={"target_z": A3_STAGE1_STAND_TARGET_Z, "std": 0.100},
     )
     reward_base_height_recovery_rate = RewTerm(
         func=mdp.reward_base_height_recovery_rate,
-        weight=260.0,
-        params={"target_z": A3_STAGE1_STAND_TARGET_Z, "deadband": 0.010, "std": 0.055, "max_rate": 1.0},
+        weight=180.0,
+        params={"target_z": A3_STAGE1_STAND_TARGET_Z, "deadband": 0.018, "std": 0.070, "max_rate": 1.0},
     )
     reward_upright_recovery_rate = RewTerm(
         func=mdp.reward_upright_recovery_rate,
-        weight=220.0,
-        params={"deadband": 0.012, "std": 0.045, "max_rate": 1.0},
+        weight=180.0,
+        params={"deadband": 0.018, "std": 0.055, "max_rate": 1.0},
     )
     reward_xy_anchor = RewTerm(
         func=mdp.reward_robot_xy_target_stability_gated,
-        weight=0.0,
+        weight=60.0,
         params={
             "target_xy": A3_STAGE1_INVALID_ROBOT_XY,
-            "std": 0.20,
-            "gate_floor": 0.0,
-            "score_kwargs": _a3_stage1_score_kwargs(),
+            "std": 0.120,
+            "gate_floor": 0.25,
+            "score_kwargs": _a3_stage1_stand_score_kwargs(),
         },
     )
     penalty_stage1_xy_drift = RewTerm(
         func=mdp.penalty_robot_xy_drift,
-        weight=-1.0,
+        weight=-28.0,
         params={
             "target_xy": A3_STAGE1_INVALID_ROBOT_XY,
-            "x_margin": 0.08,
-            "y_margin": 0.08,
-            "std": 0.16,
-            "max_penalty": 8.0,
+            "x_margin": 0.035,
+            "y_margin": 0.035,
+            "std": 0.120,
+            "max_penalty": 5.0,
         },
     )
     penalty_stage1_forward_x_velocity = RewTerm(
         func=mdp.penalty_robot_forward_x_velocity,
-        weight=-1.0,
-        params={"max_vx": 0.02, "std": 0.14, "max_penalty": 4.0},
+        weight=-8.0,
+        params={"max_vx": 0.015, "std": 0.120, "max_penalty": 4.0},
     )
     penalty_stage1_forward_x_velocity_bound = RewTerm(
         func=mdp.penalty_robot_forward_x_velocity_after_bound,
-        weight=-1.0,
-        params={"min_x": -1.38, "max_vx": 0.0, "x_std": 0.12, "vx_std": 0.14, "max_penalty": 4.0},
+        weight=-6.0,
+        params={"min_x": -1.405, "max_vx": 0.0, "x_std": 0.080, "vx_std": 0.120, "max_penalty": 4.0},
     )
     reward_stage1_xy_return_velocity = RewTerm(
         func=mdp.reward_robot_axis_velocity_towards_target_stability_gated,
-        weight=0.0,
+        weight=36.0,
         params={
             "target_xy": A3_STAGE1_INVALID_ROBOT_XY,
-            "x_margin": 0.05,
-            "y_margin": 0.05,
-            "max_x_speed": 0.06,
-            "max_y_speed": 0.04,
-            "x_weight": 0.80,
-            "y_weight": 0.20,
-            "gate_floor": 0.0,
-            "score_kwargs": _a3_stage1_score_kwargs(),
+            "x_margin": 0.035,
+            "y_margin": 0.035,
+            "max_x_speed": 0.080,
+            "max_y_speed": 0.060,
+            "x_weight": 0.70,
+            "y_weight": 0.30,
+            "gate_floor": 0.20,
+            "score_kwargs": _a3_stage1_stand_score_kwargs(),
         },
     )
     penalty_stage1_xy_away_velocity = RewTerm(
         func=mdp.penalty_robot_axis_velocity_away_from_target,
-        weight=-1.0,
+        weight=-14.0,
         params={
             "target_xy": A3_STAGE1_INVALID_ROBOT_XY,
-            "x_margin": 0.05,
-            "y_margin": 0.05,
-            "x_std": 0.16,
-            "y_std": 0.16,
-            "x_weight": 0.80,
-            "y_weight": 0.20,
-            "max_penalty": 6.0,
+            "x_margin": 0.035,
+            "y_margin": 0.035,
+            "x_std": 0.130,
+            "y_std": 0.130,
+            "x_weight": 0.70,
+            "y_weight": 0.30,
+            "max_penalty": 5.0,
         },
     )
     penalty_height_margin = RewTerm(
         func=mdp.penalty_robot_low_base_height,
-        weight=-520.0,
-        params={"min_z": 0.965, "std": 0.040, "max_penalty": 14.0},
+        weight=-220.0,
+        params={"min_z": 0.965, "std": 0.055, "max_penalty": 8.0},
     )
     penalty_low_base_height_barrier = RewTerm(
         func=mdp.penalty_robot_low_base_height_barrier,
-        weight=-700.0,
-        params={"soft_min_z": 0.955, "hard_min_z": 0.840, "power": 2.0, "max_penalty": 10.0},
+        weight=-360.0,
+        params={"soft_min_z": 0.945, "hard_min_z": 0.830, "power": 2.0, "max_penalty": 8.0},
     )
     penalty_low_base_height = RewTerm(
         func=mdp.penalty_robot_low_base_height,
-        weight=-620.0,
-        params={"min_z": 0.935, "std": 0.035, "max_penalty": 16.0},
+        weight=-360.0,
+        params={"min_z": 0.940, "std": 0.050, "max_penalty": 12.0},
     )
     penalty_flat_orientation_margin = RewTerm(
         func=mdp.penalty_flat_orientation_margin,
-        weight=-680.0,
-        params={"max_flat_l2": 0.070, "std": 0.045, "max_penalty": 14.0},
+        weight=-320.0,
+        params={"max_flat_l2": 0.095, "std": 0.060, "max_penalty": 10.0},
+    )
+    penalty_stage1_forward_pitch_margin = RewTerm(
+        func=mdp.penalty_stage1_forward_pitch_margin,
+        weight=-65.0,
+        params={"max_forward_gravity_x": 0.115, "std": 0.065, "max_penalty": 6.0},
     )
     penalty_stage1_bad_posture = RewTerm(
         func=mdp.penalty_stage1_bad_posture,
-        weight=-620.0,
+        weight=-340.0,
         params={
             "min_base_z": 0.950,
-            "max_flat_l2": 0.090,
-            "height_std": 0.040,
-            "flat_std": 0.045,
-            "max_penalty": 18.0,
+            "max_flat_l2": 0.120,
+            "height_std": 0.055,
+            "flat_std": 0.060,
+            "max_penalty": 12.0,
         },
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.90)
-    action_l2 = RewTerm(func=mdp.action_l2, weight=-1.80)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.18)
+    action_l2 = RewTerm(func=mdp.action_l2, weight=-0.12)
+    action_l2_healthy = RewTerm(
+        func=mdp.penalty_action_l2_healthy_gated,
+        weight=-0.55,
+        params={
+            "target_z": A3_STAGE1_STAND_TARGET_Z,
+            "z_deadband": 0.030,
+            "z_std": 0.075,
+            "max_flat_l2": 0.095,
+            "flat_std": 0.065,
+            "target_xy": A3_STAGE1_INVALID_ROBOT_XY,
+            "x_margin": 0.040,
+            "y_margin": 0.040,
+            "xy_std": 0.120,
+            "min_gate": 0.05,
+        },
+    )
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=0.0,
@@ -1944,10 +1956,29 @@ class A3Stage1StandRewardCfg(A3Stage1BalanceMoveRewardCfg):
             "asset_cfg": SceneEntityCfg("robot", body_names=A3_FEET_BODY_NAMES),
         },
     )
+    reward_stage1_healthy_p0_hold = RewTerm(
+        func=mdp.reward_stage1_healthy_p0_hold,
+        weight=520.0,
+        params={
+            "target_z": A3_STAGE1_STAND_TARGET_Z,
+            "min_z": 0.940,
+            "z_deadband": 0.030,
+            "z_std": 0.060,
+            "z_transition": 0.050,
+            "max_flat_l2": 0.090,
+            "flat_std": 0.035,
+            "max_forward_gravity_x": 0.115,
+            "forward_std": 0.055,
+            "target_xy": A3_STAGE1_INVALID_ROBOT_XY,
+            "x_margin": 0.040,
+            "y_margin": 0.040,
+            "xy_std": 0.120,
+        },
+    )
     reward_standing_stability = RewTerm(
         func=mdp.reward_standing_stability_height_gated,
         weight=520.0,
-        params={"min_z": 0.950, "transition": 0.050, "floor": 0.0, **_a3_stage1_stand_stability_params()},
+        params={"min_z": 0.950, "transition": 0.055, "floor": 0.0, **_a3_stage1_stand_stability_params()},
     )
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
@@ -1982,8 +2013,22 @@ class A3Stage1StandRewardCfg(A3Stage1BalanceMoveRewardCfg):
 
 
 @configclass
+class A3Stage1StandCurriculumCfg(CurriculumCfg):
+    action_scale_to_nominal = CurrTerm(
+        func=mdp.modify_action_scale_linear,
+        params={
+            "start_scale": 0.25,
+            "target_scale": 1.00,
+            "start_step": 0,
+            "end_step": 96_000,
+        },
+    )
+
+
+@configclass
 class A3Stage1StandEnvCfg(A3Stage1BalanceMoveEnvCfg):
     reward = A3Stage1StandRewardCfg()
+    curriculum = A3Stage1StandCurriculumCfg()
 
     def __post_init__(self):
         super().__post_init__()
@@ -2006,9 +2051,9 @@ class A3Stage1StandEnvCfg(A3Stage1BalanceMoveEnvCfg):
         }
         self.robot.termination_min_base_z = 0.830
         self.robot.termination_max_flat_orientation_l2 = 0.360
-        self.robot.stage1_bad_posture_min_base_z = 0.900
-        self.robot.stage1_bad_posture_max_flat_orientation_l2 = 0.280
-        self.robot.stage1_bad_posture_max_steps = 140
+        self.robot.stage1_bad_posture_min_base_z = 0.905
+        self.robot.stage1_bad_posture_max_flat_orientation_l2 = 0.205
+        self.robot.stage1_bad_posture_max_steps = 80
         self.robot.stage1_recovery_target_z = A3_STAGE1_STAND_TARGET_Z
 
 
@@ -2037,9 +2082,9 @@ class A3Stage1StandEvalEnvCfg(A3Stage1BalanceMoveEvalEnvCfg):
         }
         self.robot.termination_min_base_z = 0.830
         self.robot.termination_max_flat_orientation_l2 = 0.360
-        self.robot.stage1_bad_posture_min_base_z = 0.900
-        self.robot.stage1_bad_posture_max_flat_orientation_l2 = 0.280
-        self.robot.stage1_bad_posture_max_steps = 140
+        self.robot.stage1_bad_posture_min_base_z = 0.905
+        self.robot.stage1_bad_posture_max_flat_orientation_l2 = 0.205
+        self.robot.stage1_bad_posture_max_steps = 80
         self.robot.stage1_recovery_target_z = A3_STAGE1_STAND_TARGET_Z
 
 
@@ -3515,7 +3560,7 @@ class A3Stage1StandAgentCfg(A3Stage1BalanceMoveAgentCfg):
     experiment_name: str = "a3_table_tennis_stage1_stand"
     policy = RslRlPpoActorCriticCfg(
         class_name="ActorCritic",
-        init_noise_std=0.060,
+        init_noise_std=0.020,
         noise_std_type="log",
         actor_hidden_dims=[512, 512, 128],
         critic_hidden_dims=[512, 512, 128],
@@ -3525,21 +3570,21 @@ class A3Stage1StandAgentCfg(A3Stage1BalanceMoveAgentCfg):
         class_name="PPO",
         value_loss_coef=0.20,
         use_clipped_value_loss=True,
-        clip_param=0.050,
+        clip_param=0.060,
         entropy_coef=0.0,
         num_learning_epochs=2,
         num_mini_batches=8,
-        learning_rate=1.2e-5,
+        learning_rate=3.0e-5,
         schedule="fixed",
         gamma=0.95,
         lam=0.95,
-        desired_kl=0.003,
+        desired_kl=0.004,
         max_grad_norm=1.0,
         normalize_advantage_per_mini_batch=True,
         symmetry_cfg=None,
         rnd_cfg=None,
     )
-    algorithm.mean_action_l2_coef = 1.5
+    algorithm.mean_action_l2_coef = 0.02
     algorithm.deterministic_actions = False
     algorithm.freeze_actor = False
 

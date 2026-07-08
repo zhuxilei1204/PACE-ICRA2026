@@ -493,10 +493,19 @@ def _configure_env(env_cfg, args: argparse.Namespace, num_envs: int) -> None:
         "pitch": (0.0, 0.0),
         "yaw": (0.0, 0.0),
     }
-    env_cfg.domain_rand.events.reset_locomotion_joints.params["position_range"] = (1.0, 1.0)
-    env_cfg.domain_rand.events.reset_locomotion_joints.params["velocity_range"] = (0.0, 0.0)
-    env_cfg.domain_rand.events.reset_manipulation_joints.params["position_range"] = (0.0, 0.0)
-    env_cfg.domain_rand.events.reset_manipulation_joints.params["velocity_range"] = (0.0, 0.0)
+    reset_locomotion = getattr(env_cfg.domain_rand.events, "reset_locomotion_joints", None)
+    if reset_locomotion is not None:
+        if "position_range" in reset_locomotion.params:
+            reset_locomotion.params["position_range"] = (1.0, 1.0)
+        if "velocity_range" in reset_locomotion.params:
+            reset_locomotion.params["velocity_range"] = (0.0, 0.0)
+
+    reset_manipulation = getattr(env_cfg.domain_rand.events, "reset_manipulation_joints", None)
+    if reset_manipulation is not None:
+        if "position_range" in reset_manipulation.params:
+            reset_manipulation.params["position_range"] = (0.0, 0.0)
+        if "velocity_range" in reset_manipulation.params:
+            reset_manipulation.params["velocity_range"] = (0.0, 0.0)
 
     env_cfg.ball.ball_speed_x_range = (0.0, 0.0)
     env_cfg.ball.ball_speed_y_range = (0.0, 0.0)
